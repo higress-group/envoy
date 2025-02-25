@@ -175,6 +175,15 @@ Http::FilterHeadersStatus CorsFilter::encodeHeaders(Http::ResponseHeaderMap& hea
     return Http::FilterHeadersStatus::Continue;
   }
 
+  // Reinitialize CORS policy, based on current route (may have changed)
+  initializeCorsPolicies();
+
+  // Check whether the current route allows the origin
+  if (!isOriginAllowed(Http::HeaderString(latched_origin_))) {
+    config_->stats().origin_invalid_.inc();
+    return Http::FilterHeadersStatus::Continue;
+  }
+
   headers.setInline(access_control_allow_origin_handle.handle(), latched_origin_);
   if (allowCredentials()) {
     headers.setReferenceInline(access_control_allow_credentials_handle.handle(),
