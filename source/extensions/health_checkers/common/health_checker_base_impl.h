@@ -104,6 +104,9 @@ protected:
   virtual envoy::data::core::v3::HealthCheckerType healthCheckerType() const PURE;
 
   const bool always_log_health_check_failures_;
+#if defined(HIGRESS)
+  const bool store_metrics_;
+#endif
   const Cluster& cluster_;
   Event::Dispatcher& dispatcher_;
   const std::chrono::milliseconds timeout_;

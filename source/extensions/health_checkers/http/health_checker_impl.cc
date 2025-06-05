@@ -213,7 +213,13 @@ void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::decodeHeaders(
 
 void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::decodeData(Buffer::Instance& data,
                                                                      bool end_stream) {
+#if defined(HIGRESS)
+  if (parent_.store_metrics_) {
+    response_body_->move(data, data.length());
+  } else if (parent_.response_buffer_size_ != 0) {
+#else
   if (parent_.response_buffer_size_ != 0) {
+#endif
     if (!parent_.receive_bytes_.empty() &&
         response_body_->length() < parent_.response_buffer_size_) {
       response_body_->move(data, parent_.response_buffer_size_ - response_body_->length());
@@ -323,6 +329,12 @@ HttpHealthCheckerImpl::HttpActiveHealthCheckSession::healthCheckResult() {
   const uint64_t response_code = Http::Utility::getResponseStatus(*response_headers_);
   ENVOY_CONN_LOG(debug, "hc response_code={} health_flags={}", *client_, response_code,
                  HostUtility::healthFlagsToString(*host_));
+
+#if defined(HIGRESS)
+  ENVOY_CONN_LOG(debug, "hc hostname={}, address={} response_body_length={}", 
+    *client_, host_->hostname(), host_->address()->asString(), response_body_->length());
+  host_->setEndpointMetrics(response_body_->toString());
+#endif
 
   if (!parent_.receive_bytes_.empty()) {
     // If the expected response is set, check the first 1024 bytes of actual response if contains

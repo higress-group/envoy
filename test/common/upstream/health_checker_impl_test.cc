@@ -549,6 +549,25 @@ public:
     addCompletionCallback();
   }
 
+
+#if defined(HIGRESS)
+  void setupLLMServiceWithExpectedResponseHC() {
+    // Response: Base64 string of "Everything OK".
+    std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    interval_jitter: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    store_metrics: true
+    http_health_check:
+      path: /metrics
+    )EOF";
+    allocHealthChecker(yaml);
+    addCompletionCallback();
+  }
+#endif
+
   const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig
   makeHealthCheckConfig(const uint32_t port_value) {
     envoy::config::endpoint::v3::Endpoint::HealthCheckConfig config;
@@ -6647,6 +6666,30 @@ TEST(HealthCheckProto, Validation) {
                             "Proto constraint validation failed.*value is required.*");
   }
 }
+
+#if defined(HIGRESS)
+TEST_F(HttpHealthCheckerImplTest, LLMServiceHealthCheckSuccess) {
+  setupLLMServiceWithExpectedResponseHC();
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  health_checker_->start();
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .WillOnce(Return(45000));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_,
+              enableTimer(std::chrono::milliseconds(45000), _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respondBody(0, "200", {"Test Everything OK"});
+  EXPECT_EQ(Host::Health::Healthy,
+            cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->coarseHealth());
+}
+#endif
+
 
 } // namespace
 } // namespace Upstream

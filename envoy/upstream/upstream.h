@@ -282,6 +282,17 @@ public:
    * Set true to disable active health check for the host.
    */
   virtual void setDisableActiveHealthCheck(bool disable_active_health_check) PURE;
+
+#if defined(HIGRESS)
+  /**
+   * @return endpoint metrics string.
+   */
+  virtual std::string getEndpointMetrics() const PURE;
+  /**
+   * set endpoint metrics string.
+   */
+  virtual void setEndpointMetrics(absl::string_view endpoint_metrics) PURE;
+#endif
 };
 
 using HostConstSharedPtr = std::shared_ptr<const Host>;

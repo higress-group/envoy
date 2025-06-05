@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <list>
@@ -455,6 +456,29 @@ public:
     return std::make_unique<HostHandleImpl>(shared_from_this());
   }
 
+#if defined(HIGRESS)
+  std::string getEndpointMetrics() const override {
+    if (endpoint_metrics_ptr_ != nullptr) {
+      auto* ptr = endpoint_metrics_ptr_.load(std::memory_order_acquire);
+      return *ptr;
+    } else {
+      return "";
+    }
+  }
+  
+  void setEndpointMetrics(absl::string_view endpoint_metrics) override {
+    if (set_backup_) {
+      endpoint_metrics_backup_ = endpoint_metrics;
+      endpoint_metrics_ptr_.store(&endpoint_metrics_backup_, std::memory_order_release);
+      set_backup_ = false;
+    } else {
+      endpoint_metrics_ = endpoint_metrics;
+      endpoint_metrics_ptr_.store(&endpoint_metrics_, std::memory_order_release);
+      set_backup_ = true;
+    }
+  }
+#endif
+
 protected:
   static CreateConnectionData
   createConnection(Event::Dispatcher& dispatcher, const ClusterInfo& cluster,
@@ -492,6 +516,13 @@ private:
     const std::weak_ptr<const HostImpl> parent_;
   };
   mutable std::atomic<uint32_t> handle_count_{};
+
+#if defined(HIGRESS)
+  std::string endpoint_metrics_;
+  std::string endpoint_metrics_backup_;
+  std::atomic<std::string*> endpoint_metrics_ptr_;
+  bool set_backup_ = false;
+#endif
 };
 
 class HostsPerLocalityImpl : public HostsPerLocality {

@@ -306,4 +306,6 @@ message HealthCheck {
 
   // This allows overriding the cluster TLS settings, just for health check connections.
   TlsOptions tls_options = 21;
+    
+  bool store_metrics = 127;
 }
