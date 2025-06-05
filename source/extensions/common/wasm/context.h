@@ -30,6 +30,7 @@ using proxy_wasm::CloseType;
 using proxy_wasm::ContextBase;
 using proxy_wasm::Pairs;
 using proxy_wasm::PairsWithStringValues;
+using proxy_wasm::StringPairs;
 using proxy_wasm::PluginBase;
 using proxy_wasm::PluginHandleBase;
 using proxy_wasm::SharedQueueDequeueToken;
@@ -217,6 +218,12 @@ public:
   WasmResult sendLocalResponse(uint32_t response_code, std::string_view body_text,
                                Pairs additional_headers, uint32_t grpc_status,
                                std::string_view details) override;
+#if defined(HIGRESS)
+  WasmResult injectEncodedDataToFilterChain(std::string_view body_text, bool end_stream) override;
+  WasmResult getUpstreamHosts(StringPairs * result) override;
+  WasmResult setUpstreamOverrideHost(std::string_view address) override;
+#endif
+                             
   void clearRouteCache() override {
 #if defined(HIGRESS)
     if (decoder_callbacks_ && !disable_clear_route_cache_) {
