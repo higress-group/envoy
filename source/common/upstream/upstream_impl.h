@@ -520,7 +520,7 @@ private:
 #if defined(HIGRESS)
   std::string endpoint_metrics_;
   std::string endpoint_metrics_backup_;
-  std::atomic<std::string*> endpoint_metrics_ptr_;
+  std::atomic<std::string*> endpoint_metrics_ptr_{nullptr};
   bool set_backup_ = false;
 #endif
 };
