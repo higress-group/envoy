@@ -236,7 +236,7 @@ func envoyGoFilterOnHttpHeader(s *C.processState, endStream, headerNum, headerBy
 
 //export envoyGoFilterOnHttpData
 func envoyGoFilterOnHttpData(s *C.processState, endStream, buffer, length uint64) uint64 {
-	state := getState(s)
+	state := getOrCreateState(s)
 
 	req := state.request
 	if req.pInfo.paniced {
