@@ -96,6 +96,16 @@ public:
 
 #if defined(HIGRESS)
   LifecycleStats& lifecycleStats() { return lifecycle_stats_handler_.stats(); }
+  void incrementActiveStreamCount() { ++active_stream_count_; }
+  void decrementActiveStreamCount() {
+    ASSERT(active_stream_count_ > 0);
+    if (active_stream_count_ == 0) {
+      ENVOY_LOG(error, "wasm active stream count underflow");
+      return;
+    }
+    --active_stream_count_;
+  }
+  uint64_t activeStreamCount() const { return active_stream_count_; }
 #endif
 
 protected:
@@ -120,6 +130,7 @@ protected:
   RuntimeStatsHandler runtime_stats_handler_;
   Event::TimerPtr runtime_stats_timer_;
   static constexpr std::chrono::milliseconds kRuntimeStatsInterval{1000};
+  uint64_t active_stream_count_ = 0;
 #endif
 
   // Lifecycle stats
@@ -182,10 +193,6 @@ public:
   PluginHandleSharedPtrThreadLocal() = default;
 
   bool rebuild(bool is_fail_recovery = false);
-
-private:
-  MonotonicTime last_recover_time_;
-  std::weak_ptr<PluginHandle> old_handle_;
 };
 #else
 class PluginHandleSharedPtrThreadLocal : public ThreadLocal::ThreadLocalObject {
@@ -219,6 +226,9 @@ getOrCreateThreadLocalPlugin(const WasmHandleSharedPtr& base_wasm, const PluginS
 
 void clearCodeCacheForTesting();
 void setTimeOffsetForCodeCacheForTesting(MonotonicTime::duration d);
+#if defined(HIGRESS)
+size_t rebuildGuardRegistrySizeForTesting();
+#endif
 WasmEvent toWasmEvent(const std::shared_ptr<WasmHandleBase>& wasm);
 
 class PluginConfig : Logger::Loggable<Logger::Id::wasm> {

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <string>
+#include <vector>
 
 #include "envoy/event/deferred_deletable.h"
 #include "envoy/extensions/wasm/v3/wasm.pb.h"
@@ -14,6 +16,7 @@
 #include "source/extensions/common/wasm/remote_async_datasource.h"
 #include "source/extensions/common/wasm/stats_handler.h"
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/strings/str_cat.h"
 
 using proxy_wasm::FailState;
@@ -90,6 +93,62 @@ WasmEvent failStateToWasmEvent(FailState state) {
 }
 
 const int MIN_RECOVER_INTERVAL_SECONDS = 1;
+
+struct RebuildGuardEntry {
+  MonotonicTime last_recover_time;
+  std::weak_ptr<WasmHandle> current_wasm_handle;
+  std::vector<std::weak_ptr<WasmHandle>> old_wasm_handles;
+
+  void pruneExpired(const WasmHandleSharedPtr& current_wasm_handle = nullptr) {
+    old_wasm_handles.erase(
+        std::remove_if(old_wasm_handles.begin(), old_wasm_handles.end(),
+                       [&current_wasm_handle](const std::weak_ptr<WasmHandle>& old_wasm_handle) {
+                         auto locked = old_wasm_handle.lock();
+                         return locked == nullptr || (current_wasm_handle != nullptr &&
+                                                      locked.get() == current_wasm_handle.get());
+                       }),
+        old_wasm_handles.end());
+  }
+
+  bool hasLiveOldGeneration(const WasmHandleSharedPtr& current_wasm_handle) {
+    pruneExpired(current_wasm_handle);
+    return !old_wasm_handles.empty();
+  }
+
+  void trackCurrentGeneration(const WasmHandleSharedPtr& wasm_handle) {
+    current_wasm_handle = wasm_handle;
+  }
+
+  void trackOldGeneration(const WasmHandleSharedPtr& old_wasm_handle) {
+    if (old_wasm_handle == nullptr) {
+      return;
+    }
+    pruneExpired();
+    old_wasm_handles.push_back(old_wasm_handle);
+  }
+
+  bool canRetire() {
+    pruneExpired();
+    return current_wasm_handle.expired() && old_wasm_handles.empty();
+  }
+};
+
+thread_local absl::flat_hash_map<std::string, RebuildGuardEntry> rebuild_guard_registry;
+
+void sweepRebuildGuardRegistry(const std::string& active_vm_key) {
+  for (auto it = rebuild_guard_registry.begin(); it != rebuild_guard_registry.end();) {
+    if (it->first == active_vm_key) {
+      ++it;
+      continue;
+    }
+    if (it->second.canRetire()) {
+      auto erase_it = it++;
+      rebuild_guard_registry.erase(erase_it);
+    } else {
+      ++it;
+    }
+  }
+}
 #endif
 
 } // namespace
@@ -218,26 +277,39 @@ bool PluginHandleSharedPtrThreadLocal::rebuild(bool is_fail_recovery) {
     ENVOY_LOG(warn, "wasm has not been initialized");
     return false;
   }
-  auto& dispatcher = handle->wasmHandle()->wasm()->dispatcher();
+  auto current_wasm_handle = handle->wasmHandle();
+  auto current_wasm = current_wasm_handle->wasm();
+  const std::string vm_key(current_wasm->vm_key());
+  sweepRebuildGuardRegistry(vm_key);
+  auto& guard = rebuild_guard_registry[vm_key];
+  guard.trackCurrentGeneration(current_wasm_handle);
+  auto& dispatcher = current_wasm->dispatcher();
   auto now = dispatcher.timeSource().monotonicTime() + cache_time_offset_for_testing;
-  if (now - last_recover_time_ < std::chrono::seconds(MIN_RECOVER_INTERVAL_SECONDS)) {
-    ENVOY_LOG(info, "rebuild interval has not been reached");
+  if (now - guard.last_recover_time < std::chrono::seconds(MIN_RECOVER_INTERVAL_SECONDS)) {
+    ENVOY_LOG(info, "wasm vm rebuild skipped: recover interval has not been reached");
     return false;
   }
-  // Check if old handle is still alive (still being referenced by old requests)
-  // If it's still alive, we don't want to create another VM to prevent memory accumulation
-  // For fail recovery scenarios, skip this check to ensure recovery can proceed
-  if (!is_fail_recovery && !old_handle_.expired()) {
-    ENVOY_LOG(info, "old wasm vm handle is still in use, skipping rebuild to prevent VM accumulation");
-    return false;
+  if (!is_fail_recovery && guard.hasLiveOldGeneration(current_wasm_handle)) {
+    const auto active_stream_count = current_wasm->activeStreamCount();
+    if (active_stream_count > 0) {
+      ENVOY_LOG(info,
+                "wasm vm proactive rebuild skipped: old generation is still live and current "
+                "generation has {} active streams",
+                active_stream_count);
+      return false;
+    }
   }
   // Even if rebuild fails, it will be retried after the interval
-  last_recover_time_ = now;
+  guard.last_recover_time = now;
   std::shared_ptr<PluginHandleBase> new_handle;
-  if (handle->rebuild(new_handle)) {
-    // Store weak_ptr to current handle before replacing it
-    old_handle_ = handle;
-    handle = std::static_pointer_cast<PluginHandle>(new_handle);
+  if (handle->rebuild(new_handle) && new_handle != nullptr) {
+    auto new_plugin_handle = std::static_pointer_cast<PluginHandle>(new_handle);
+    auto new_wasm_handle = new_plugin_handle->wasmHandle();
+    if (new_wasm_handle != nullptr && new_wasm_handle.get() != current_wasm_handle.get()) {
+      guard.trackOldGeneration(current_wasm_handle);
+    }
+    guard.trackCurrentGeneration(new_wasm_handle);
+    handle = new_plugin_handle;
     // Increment appropriate metrics based on rebuild type
     if (is_fail_recovery) {
       handle->wasmHandle()->wasm()->lifecycleStats().recover_total_.inc();
@@ -248,6 +320,7 @@ bool PluginHandleSharedPtrThreadLocal::rebuild(bool is_fail_recovery) {
     }
     return true;
   }
+  ENVOY_LOG(info, "wasm vm {} execution failed", is_fail_recovery ? "recover" : "rebuild");
   return false;
 }
 #endif
@@ -345,8 +418,16 @@ void clearCodeCacheForTesting() {
     delete code_cache;
     code_cache = nullptr;
   }
+  cache_time_offset_for_testing = {};
+#if defined(HIGRESS)
+  rebuild_guard_registry.clear();
+#endif
   getCreateStatsHandler().resetStatsForTesting();
 }
+
+#if defined(HIGRESS)
+size_t rebuildGuardRegistrySizeForTesting() { return rebuild_guard_registry.size(); }
+#endif
 
 // TODO: remove this post #4160: Switch default to SimulatedTimeSystem.
 void setTimeOffsetForCodeCacheForTesting(MonotonicTime::duration d) {

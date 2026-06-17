@@ -1,3 +1,5 @@
+#include <chrono>
+
 #include "envoy/grpc/async_client.h"
 #include "envoy/redis/async_client.h"
 
@@ -35,7 +37,9 @@ namespace Wasm {
 
 using Envoy::Extensions::Common::Wasm::CreateContextFn;
 using Envoy::Extensions::Common::Wasm::Plugin;
+using Envoy::Extensions::Common::Wasm::PluginHandle;
 using Envoy::Extensions::Common::Wasm::PluginHandleSharedPtr;
+using Envoy::Extensions::Common::Wasm::PluginHandleSharedPtrThreadLocal;
 using Envoy::Extensions::Common::Wasm::Wasm;
 using Envoy::Extensions::Common::Wasm::WasmHandleSharedPtr;
 using proxy_wasm::ContextBase;
@@ -97,10 +101,55 @@ public:
   TestRoot& rootContext() { return *static_cast<TestRoot*>(root_context_); }
   TestFilter& filter() { return *static_cast<TestFilter*>(context_.get()); }
 
+#if defined(HIGRESS)
+  void advanceRebuildInterval() {
+    rebuild_time_offset_ += std::chrono::seconds(2);
+    Envoy::Extensions::Common::Wasm::setTimeOffsetForCodeCacheForTesting(rebuild_time_offset_);
+  }
+
+  bool rebuildThroughThreadLocal(PluginHandleSharedPtrThreadLocal& thread_local_handle,
+                                 bool is_fail_recovery = false) {
+    if (!is_fail_recovery && thread_local_handle.handle != nullptr &&
+        thread_local_handle.handle->wasmHandle() != nullptr &&
+        thread_local_handle.handle->wasmHandle()->wasm() != nullptr) {
+      thread_local_handle.handle->wasmHandle()->wasm()->setShouldRebuild(true);
+    }
+    const bool rebuilt = thread_local_handle.rebuild(is_fail_recovery);
+    if (rebuilt) {
+      plugin_handle_ = thread_local_handle.handle;
+      wasm_ = plugin_handle_->wasmHandle();
+      if (!is_fail_recovery && wasm_ != nullptr && wasm_->wasm() != nullptr) {
+        wasm_->wasm()->setShouldRebuild(false);
+      }
+    }
+    return rebuilt;
+  }
+
+  std::unique_ptr<TestFilter> makeStreamContext(const PluginHandleSharedPtr& plugin_handle) {
+    auto* wasm = plugin_handle != nullptr && plugin_handle->wasmHandle() != nullptr
+                     ? plugin_handle->wasmHandle()->wasm().get()
+                     : nullptr;
+    const uint32_t root_context_id = wasm != nullptr ? plugin_handle->rootContextId() : 0;
+    return std::make_unique<TestFilter>(wasm, root_context_id, plugin_handle);
+  }
+
+  void releaseWasmState() {
+    context_.reset();
+    plugin_handle_.reset();
+    wasm_.reset();
+    base_wasm_.reset();
+    plugin_.reset();
+    root_context_ = nullptr;
+  }
+#endif
+
 protected:
   NiceMock<Grpc::MockAsyncStream> async_stream_;
   Grpc::MockAsyncClientManager async_client_manager_;
   NiceMock<Tracing::MockSpan> mock_span_;
+#if defined(HIGRESS)
+  std::chrono::seconds rebuild_time_offset_{0};
+#endif
 };
 
 INSTANTIATE_TEST_SUITE_P(RuntimesAndLanguages, WasmHttpFilterTest,
@@ -2081,6 +2130,270 @@ TEST_P(WasmHttpFilterTest, GetVMMemorySize) {
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter().decodeHeaders(request_headers, false));
   filter().onDestroy();
 }
+
+TEST_P(WasmHttpFilterTest, ActiveStreamCounterTracksStreamContextLifetime) {
+  auto runtime = std::get<0>(GetParam());
+  if (runtime == "null") {
+    return;
+  }
+  if (std::get<1>(GetParam()) != "cpp") {
+    return;
+  }
+
+  setupTest("", "RebuildTest");
+  EXPECT_EQ(0U, wasm_->wasm()->activeStreamCount());
+
+  {
+    auto stream_context = makeStreamContext(plugin_handle_);
+    EXPECT_EQ(1U, wasm_->wasm()->activeStreamCount());
+    stream_context->onDestroy();
+    EXPECT_EQ(0U, wasm_->wasm()->activeStreamCount());
+  }
+  EXPECT_EQ(0U, wasm_->wasm()->activeStreamCount());
+
+  {
+    auto stream_context = makeStreamContext(plugin_handle_);
+    EXPECT_EQ(1U, wasm_->wasm()->activeStreamCount());
+  }
+  EXPECT_EQ(0U, wasm_->wasm()->activeStreamCount());
+}
+
+TEST_P(WasmHttpFilterTest, ProactiveRebuildNoOldGenerationStillSucceeds) {
+  auto runtime = std::get<0>(GetParam());
+  if (runtime == "null") {
+    return;
+  }
+  if (std::get<1>(GetParam()) != "cpp") {
+    return;
+  }
+
+  setupTest("", "RebuildTest");
+  auto& rebuild_total = scope_->counterFromString("wasm.envoy.wasm.runtime." + runtime +
+                                                  ".plugin.plugin_name.rebuild_total");
+  auto& recover_total = scope_->counterFromString("wasm.envoy.wasm.runtime." + runtime +
+                                                  ".plugin.plugin_name.recover_total");
+
+  PluginHandleSharedPtrThreadLocal thread_local_handle(plugin_handle_);
+  advanceRebuildInterval();
+  EXPECT_TRUE(rebuildThroughThreadLocal(thread_local_handle));
+  EXPECT_EQ(1U, rebuild_total.value());
+  EXPECT_EQ(0U, recover_total.value());
+}
+
+TEST_P(WasmHttpFilterTest, ProactiveRebuildSkipsWhenOldGenerationLiveAndCurrentActive) {
+  auto runtime = std::get<0>(GetParam());
+  if (runtime == "null") {
+    return;
+  }
+  if (std::get<1>(GetParam()) != "cpp") {
+    return;
+  }
+
+  setupTest("", "RebuildTest");
+  auto& rebuild_total = scope_->counterFromString("wasm.envoy.wasm.runtime." + runtime +
+                                                  ".plugin.plugin_name.rebuild_total");
+
+  PluginHandleSharedPtrThreadLocal thread_local_handle(plugin_handle_);
+  PluginHandleSharedPtr old_generation_handle = plugin_handle_;
+  ASSERT_NE(nullptr, old_generation_handle);
+
+  advanceRebuildInterval();
+  ASSERT_TRUE(rebuildThroughThreadLocal(thread_local_handle));
+  EXPECT_EQ(1U, rebuild_total.value());
+
+  auto current_stream_context = makeStreamContext(plugin_handle_);
+  EXPECT_EQ(1U, wasm_->wasm()->activeStreamCount());
+  PluginHandleSharedPtr current_generation_handle = thread_local_handle.handle;
+
+  advanceRebuildInterval();
+  EXPECT_FALSE(rebuildThroughThreadLocal(thread_local_handle));
+  EXPECT_EQ(current_generation_handle.get(), thread_local_handle.handle.get());
+  EXPECT_EQ(1U, rebuild_total.value());
+
+  current_stream_context->onDestroy();
+  EXPECT_EQ(0U, wasm_->wasm()->activeStreamCount());
+}
+
+TEST_P(WasmHttpFilterTest, ProactiveRebuildAllowsWhenOldGenerationLiveAndCurrentIdle) {
+  auto runtime = std::get<0>(GetParam());
+  if (runtime == "null") {
+    return;
+  }
+  if (std::get<1>(GetParam()) != "cpp") {
+    return;
+  }
+
+  setupTest("", "RebuildTest");
+  auto& rebuild_total = scope_->counterFromString("wasm.envoy.wasm.runtime." + runtime +
+                                                  ".plugin.plugin_name.rebuild_total");
+
+  PluginHandleSharedPtrThreadLocal thread_local_handle(plugin_handle_);
+  PluginHandleSharedPtr old_generation_handle = plugin_handle_;
+  ASSERT_NE(nullptr, old_generation_handle);
+
+  advanceRebuildInterval();
+  ASSERT_TRUE(rebuildThroughThreadLocal(thread_local_handle));
+  EXPECT_EQ(1U, rebuild_total.value());
+  EXPECT_EQ(0U, wasm_->wasm()->activeStreamCount());
+
+  advanceRebuildInterval();
+  EXPECT_TRUE(rebuildThroughThreadLocal(thread_local_handle));
+  EXPECT_EQ(2U, rebuild_total.value());
+}
+
+TEST_P(WasmHttpFilterTest, ProactiveRebuildPrunesExpiredOldGenerations) {
+  auto runtime = std::get<0>(GetParam());
+  if (runtime == "null") {
+    return;
+  }
+  if (std::get<1>(GetParam()) != "cpp") {
+    return;
+  }
+
+  setupTest("", "RebuildTest");
+  auto& rebuild_total = scope_->counterFromString("wasm.envoy.wasm.runtime." + runtime +
+                                                  ".plugin.plugin_name.rebuild_total");
+
+  PluginHandleSharedPtrThreadLocal thread_local_handle(plugin_handle_);
+  advanceRebuildInterval();
+  ASSERT_TRUE(rebuildThroughThreadLocal(thread_local_handle));
+  EXPECT_EQ(1U, rebuild_total.value());
+
+  auto current_stream_context = makeStreamContext(plugin_handle_);
+  EXPECT_EQ(1U, wasm_->wasm()->activeStreamCount());
+
+  advanceRebuildInterval();
+  EXPECT_TRUE(rebuildThroughThreadLocal(thread_local_handle));
+  EXPECT_EQ(2U, rebuild_total.value());
+
+  current_stream_context->onDestroy();
+}
+
+TEST_P(WasmHttpFilterTest, RebuildGuardRegistryRetiresStaleVmKeys) {
+  auto runtime = std::get<0>(GetParam());
+  if (runtime == "null") {
+    return;
+  }
+  if (std::get<1>(GetParam()) != "cpp") {
+    return;
+  }
+
+  setupTest("", "RebuildTest");
+  {
+    PluginHandleSharedPtrThreadLocal first_thread_local_handle(plugin_handle_);
+    advanceRebuildInterval();
+    ASSERT_TRUE(rebuildThroughThreadLocal(first_thread_local_handle));
+    EXPECT_EQ(1U, Envoy::Extensions::Common::Wasm::rebuildGuardRegistrySizeForTesting());
+  }
+  releaseWasmState();
+
+  setupTest("", "RebuildTestRegistryRetire");
+  PluginHandleSharedPtrThreadLocal second_thread_local_handle(plugin_handle_);
+  advanceRebuildInterval();
+  ASSERT_TRUE(rebuildThroughThreadLocal(second_thread_local_handle));
+  EXPECT_EQ(1U, Envoy::Extensions::Common::Wasm::rebuildGuardRegistrySizeForTesting());
+}
+
+TEST_P(WasmHttpFilterTest, NewThreadLocalWrapperKeepsRebuildGuardState) {
+  auto runtime = std::get<0>(GetParam());
+  if (runtime == "null") {
+    return;
+  }
+  if (std::get<1>(GetParam()) != "cpp") {
+    return;
+  }
+
+  setupTest("", "RebuildTest");
+  auto& rebuild_total = scope_->counterFromString("wasm.envoy.wasm.runtime." + runtime +
+                                                  ".plugin.plugin_name.rebuild_total");
+
+  PluginHandleSharedPtrThreadLocal thread_local_handle(plugin_handle_);
+  PluginHandleSharedPtr old_generation_handle = plugin_handle_;
+  ASSERT_NE(nullptr, old_generation_handle);
+
+  advanceRebuildInterval();
+  ASSERT_TRUE(rebuildThroughThreadLocal(thread_local_handle));
+  EXPECT_EQ(1U, rebuild_total.value());
+
+  auto current_stream_context = makeStreamContext(plugin_handle_);
+  PluginHandleSharedPtrThreadLocal new_wrapper(plugin_handle_);
+
+  advanceRebuildInterval();
+  EXPECT_FALSE(rebuildThroughThreadLocal(new_wrapper));
+  EXPECT_EQ(1U, rebuild_total.value());
+
+  current_stream_context->onDestroy();
+}
+
+TEST_P(WasmHttpFilterTest, ActiveCounterIncludesDifferentPluginHandleOnSameGeneration) {
+  auto runtime = std::get<0>(GetParam());
+  if (runtime == "null") {
+    return;
+  }
+  if (std::get<1>(GetParam()) != "cpp") {
+    return;
+  }
+
+  setupTest("", "RebuildTest");
+  auto& rebuild_total = scope_->counterFromString("wasm.envoy.wasm.runtime." + runtime +
+                                                  ".plugin.plugin_name.rebuild_total");
+
+  PluginHandleSharedPtrThreadLocal thread_local_handle(plugin_handle_);
+  PluginHandleSharedPtr old_generation_handle = plugin_handle_;
+  ASSERT_NE(nullptr, old_generation_handle);
+
+  advanceRebuildInterval();
+  ASSERT_TRUE(rebuildThroughThreadLocal(thread_local_handle));
+  EXPECT_EQ(1U, rebuild_total.value());
+
+  auto sibling_plugin_handle =
+      std::make_shared<PluginHandle>(plugin_handle_->wasmHandle(), plugin_);
+  auto sibling_stream_context = makeStreamContext(sibling_plugin_handle);
+  EXPECT_EQ(1U, wasm_->wasm()->activeStreamCount());
+
+  advanceRebuildInterval();
+  EXPECT_FALSE(rebuildThroughThreadLocal(thread_local_handle));
+  EXPECT_EQ(1U, rebuild_total.value());
+
+  sibling_stream_context->onDestroy();
+  EXPECT_EQ(0U, wasm_->wasm()->activeStreamCount());
+}
+
+TEST_P(WasmHttpFilterTest, FailRecoveryBypassesProactiveActiveGuard) {
+  auto runtime = std::get<0>(GetParam());
+  if (runtime == "null") {
+    return;
+  }
+  if (std::get<1>(GetParam()) != "cpp") {
+    return;
+  }
+
+  setupTest("", "RebuildTest");
+  auto& rebuild_total = scope_->counterFromString("wasm.envoy.wasm.runtime." + runtime +
+                                                  ".plugin.plugin_name.rebuild_total");
+  auto& recover_total = scope_->counterFromString("wasm.envoy.wasm.runtime." + runtime +
+                                                  ".plugin.plugin_name.recover_total");
+
+  PluginHandleSharedPtrThreadLocal thread_local_handle(plugin_handle_);
+  PluginHandleSharedPtr old_generation_handle = plugin_handle_;
+  ASSERT_NE(nullptr, old_generation_handle);
+
+  advanceRebuildInterval();
+  ASSERT_TRUE(rebuildThroughThreadLocal(thread_local_handle));
+  EXPECT_EQ(1U, rebuild_total.value());
+  EXPECT_EQ(0U, recover_total.value());
+
+  auto current_stream_context = makeStreamContext(plugin_handle_);
+  EXPECT_EQ(1U, wasm_->wasm()->activeStreamCount());
+
+  advanceRebuildInterval();
+  EXPECT_TRUE(rebuildThroughThreadLocal(thread_local_handle, true));
+  EXPECT_EQ(1U, rebuild_total.value());
+  EXPECT_EQ(1U, recover_total.value());
+
+  current_stream_context->onDestroy();
+}
+
 TEST_P(WasmHttpFilterTest, RecoverFromCrash) {
   auto runtime = std::get<0>(GetParam());
   if (runtime == "null") {

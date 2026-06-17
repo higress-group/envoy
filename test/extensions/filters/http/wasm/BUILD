@@ -43,6 +43,7 @@ envoy_extension_cc_test(
         "skip_on_windows",
     ],
     deps = [
+        "//source/common/http:conn_manager_lib",
         "//source/common/http:message_lib",
         "//source/extensions/filters/http/wasm:wasm_filter_lib",
         "//test/extensions/common/wasm:wasm_runtime",
