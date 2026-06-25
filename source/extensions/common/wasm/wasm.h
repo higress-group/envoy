@@ -208,7 +208,7 @@ private:
 using PluginHandleSharedPtr = std::shared_ptr<PluginHandle>;
 
 #if defined(HIGRESS)
-enum class RebuildSource { Periodic, Memory };
+enum class RebuildSource { Explicit, Memory };
 
 class PluginHandleSharedPtrThreadLocal : public ThreadLocal::ThreadLocalObject,
                                          public Logger::Loggable<Logger::Id::wasm> {
@@ -221,7 +221,7 @@ public:
   PluginHandleSharedPtrThreadLocal() = default;
   ~PluginHandleSharedPtrThreadLocal() override;
 
-  bool rebuild(bool is_fail_recovery = false, RebuildSource source = RebuildSource::Periodic);
+  bool rebuild(bool is_fail_recovery = false, RebuildSource source = RebuildSource::Explicit);
   void runReclaimTimerForTesting();
   PluginHandleSharedPtr& handle() { return handle_; }
 

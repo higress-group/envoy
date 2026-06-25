@@ -367,13 +367,13 @@ void PluginHandleSharedPtrThreadLocal::onReclaimTimer() {
   auto wasm = handle_->wasmHandle()->wasm();
   const uint64_t memory_size = wasm->wasm_vm() != nullptr ? wasm->wasm_vm()->getMemorySize() : 0;
   const bool memory_triggered = memory_size > wasm->reclaimMemoryThreshold();
-  const bool periodic_triggered = wasm->shouldRebuild();
-  if (!memory_triggered && !periodic_triggered) {
+  const bool explicit_triggered = wasm->shouldRebuild();
+  if (!memory_triggered && !explicit_triggered) {
     rearm();
     return;
   }
 
-  RebuildSource source = RebuildSource::Periodic;
+  RebuildSource source = RebuildSource::Explicit;
   if (memory_triggered) {
     source = RebuildSource::Memory;
     wasm->markReclaimEligible();
@@ -469,7 +469,7 @@ bool PluginHandleSharedPtrThreadLocal::rebuild(bool is_fail_recovery, RebuildSou
       if (source == RebuildSource::Memory) {
         stats.rebuild_memory_total_.inc();
       } else {
-        stats.rebuild_periodic_total_.inc();
+        stats.rebuild_explicit_total_.inc();
       }
       current_wasm->recordReclaimLatency(now);
       current_wasm->clearReclaimEligible();

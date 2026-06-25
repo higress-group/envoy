@@ -112,7 +112,7 @@ public:
 
   bool rebuildThroughThreadLocal(PluginHandleSharedPtrThreadLocal& thread_local_handle,
                                  bool is_fail_recovery = false,
-                                 RebuildSource source = RebuildSource::Periodic) {
+                                 RebuildSource source = RebuildSource::Explicit) {
     if (!is_fail_recovery && thread_local_handle.handle() != nullptr &&
         thread_local_handle.handle()->wasmHandle() != nullptr &&
         thread_local_handle.handle()->wasmHandle()->wasm() != nullptr) {
@@ -2448,8 +2448,8 @@ TEST_P(WasmHttpFilterTest, ReclaimTimerRebuildsIdleVmWhenShouldRebuildIsSet) {
   setupTest("", "RebuildTest");
   auto& rebuild_total = scope_->counterFromString("wasm.envoy.wasm.runtime." + runtime +
                                                   ".plugin.plugin_name.rebuild_total");
-  auto& rebuild_periodic_total = scope_->counterFromString(
-      "wasm.envoy.wasm.runtime." + runtime + ".plugin.plugin_name.rebuild_periodic_total");
+  auto& rebuild_explicit_total = scope_->counterFromString(
+      "wasm.envoy.wasm.runtime." + runtime + ".plugin.plugin_name.rebuild_explicit_total");
   auto& rebuild_memory_total = scope_->counterFromString(
       "wasm.envoy.wasm.runtime." + runtime + ".plugin.plugin_name.rebuild_memory_total");
 
@@ -2463,7 +2463,7 @@ TEST_P(WasmHttpFilterTest, ReclaimTimerRebuildsIdleVmWhenShouldRebuildIsSet) {
   adoptThreadLocalHandle(*thread_local_handle);
 
   EXPECT_EQ(1U, rebuild_total.value());
-  EXPECT_EQ(1U, rebuild_periodic_total.value());
+  EXPECT_EQ(1U, rebuild_explicit_total.value());
   EXPECT_EQ(0U, rebuild_memory_total.value());
   EXPECT_FALSE(old_wasm->reclaimEligibleSinceForTesting().has_value());
 }
@@ -2480,8 +2480,8 @@ TEST_P(WasmHttpFilterTest, ReclaimTimerUsesMemoryThresholdSourceAndRuntimeOverri
   setupTest("", "RebuildTest");
   auto& rebuild_total = scope_->counterFromString("wasm.envoy.wasm.runtime." + runtime +
                                                   ".plugin.plugin_name.rebuild_total");
-  auto& rebuild_periodic_total = scope_->counterFromString(
-      "wasm.envoy.wasm.runtime." + runtime + ".plugin.plugin_name.rebuild_periodic_total");
+  auto& rebuild_explicit_total = scope_->counterFromString(
+      "wasm.envoy.wasm.runtime." + runtime + ".plugin.plugin_name.rebuild_explicit_total");
   auto& rebuild_memory_total = scope_->counterFromString(
       "wasm.envoy.wasm.runtime." + runtime + ".plugin.plugin_name.rebuild_memory_total");
 
@@ -2498,7 +2498,7 @@ TEST_P(WasmHttpFilterTest, ReclaimTimerUsesMemoryThresholdSourceAndRuntimeOverri
   adoptThreadLocalHandle(*thread_local_handle);
 
   EXPECT_EQ(1U, rebuild_total.value());
-  EXPECT_EQ(0U, rebuild_periodic_total.value());
+  EXPECT_EQ(0U, rebuild_explicit_total.value());
   EXPECT_EQ(1U, rebuild_memory_total.value());
   EXPECT_FALSE(old_wasm->shouldRebuild());
   EXPECT_FALSE(old_wasm->reclaimEligibleSinceForTesting().has_value());
