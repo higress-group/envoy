@@ -181,7 +181,28 @@ Context::Context(Wasm* wasm, const PluginSharedPtr& plugin) : ContextBase(wasm, 
   root_local_info_ = &std::static_pointer_cast<Plugin>(plugin)->localInfo();
 }
 Context::Context(Wasm* wasm, uint32_t root_context_id, PluginHandleSharedPtr plugin_handle)
-    : ContextBase(wasm, root_context_id, plugin_handle), plugin_handle_(plugin_handle) {}
+    : ContextBase(wasm, root_context_id, plugin_handle), plugin_handle_(plugin_handle) {
+#if defined(HIGRESS)
+  if (wasm != nullptr && plugin_handle_ != nullptr && plugin_handle_->wasmHandle() != nullptr &&
+      plugin_handle_->wasmHandle()->wasm() != nullptr) {
+    plugin_handle_->wasmHandle()->wasm()->incrementActiveStreamCount();
+    active_stream_count_recorded_ = true;
+  }
+#endif
+}
+
+#if defined(HIGRESS)
+void Context::releaseActiveStream() {
+  if (!active_stream_count_recorded_) {
+    return;
+  }
+  active_stream_count_recorded_ = false;
+  if (plugin_handle_ != nullptr && plugin_handle_->wasmHandle() != nullptr &&
+      plugin_handle_->wasmHandle()->wasm() != nullptr) {
+    plugin_handle_->wasmHandle()->wasm()->decrementActiveStreamCount();
+  }
+}
+#endif
 
 Wasm* Context::wasm() const { return static_cast<Wasm*>(wasm_); }
 Plugin* Context::plugin() const { return static_cast<Plugin*>(plugin_.get()); }
@@ -204,8 +225,14 @@ uint64_t Context::getMonotonicTimeNanoseconds() {
 
 void Context::onCloseTCP() {
   if (tcp_connection_closed_ || !in_vm_context_created_) {
+#if defined(HIGRESS)
+    releaseActiveStream();
+#endif
     return;
   }
+#if defined(HIGRESS)
+  releaseActiveStream();
+#endif
   tcp_connection_closed_ = true;
   onDone();
   onLog();
@@ -1436,6 +1463,7 @@ WasmResult Context::setProperty(std::string_view path, std::string_view value) {
   if (path == WasmRebuildKey) {
     if (wasm_) {
       wasm_->setShouldRebuild(true);
+      wasm()->markReclaimEligible();
       ENVOY_LOG(debug, "Wasm rebuild flag set by plugin");
     }
     return WasmResult::Ok;
@@ -1658,6 +1686,9 @@ WasmResult Context::getMetric(uint32_t metric_id, uint64_t* result_uint64_ptr) {
 }
 
 Context::~Context() {
+#if defined(HIGRESS)
+  releaseActiveStream();
+#endif
   // Cancel any outstanding requests.
   for (auto& p : http_request_) {
     p.second.request_->cancel();
@@ -1844,6 +1875,9 @@ void Context::log(const Http::RequestHeaderMap* request_headers,
 }
 
 void Context::onDestroy() {
+#if defined(HIGRESS)
+  releaseActiveStream();
+#endif
   if (destroyed_ || !in_vm_context_created_) {
     return;
   }

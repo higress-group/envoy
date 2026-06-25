@@ -14,6 +14,9 @@
 #include "test/mocks/grpc/mocks.h"
 #include "test/mocks/http/mocks.h"
 #include "test/mocks/network/mocks.h"
+#if defined(HIGRESS)
+#include "test/mocks/runtime/mocks.h"
+#endif
 #include "test/mocks/server/mocks.h"
 #include "test/mocks/ssl/mocks.h"
 #include "test/mocks/stream_info/mocks.h"
@@ -81,6 +84,18 @@ public:
         &listener_metadata_);
     plugin_->wasmConfig().allowedCapabilities() = allowed_capabilities_;
     // Passes ownership of root_context_.
+#if defined(HIGRESS)
+    Extensions::Common::Wasm::createWasm(
+        plugin_, scope_, cluster_manager_, init_manager_, dispatcher_, *api, lifecycle_notifier_,
+        remote_data_provider_, [this](WasmHandleSharedPtr wasm) { base_wasm_ = wasm; }, create_root,
+        &runtime_);
+    plugin_handle_ = getOrCreateThreadLocalPlugin(
+        base_wasm_, plugin_, dispatcher_,
+        [this, create_root](Wasm* wasm, const std::shared_ptr<Plugin>& plugin) {
+          root_context_ = static_cast<Context*>(create_root(wasm, plugin));
+          return root_context_;
+        });
+#else
     Extensions::Common::Wasm::createWasm(
         plugin_, scope_, cluster_manager_, init_manager_, dispatcher_, *api, lifecycle_notifier_,
         remote_data_provider_, [this](WasmHandleSharedPtr wasm) { wasm_ = wasm; }, create_root);
@@ -90,6 +105,7 @@ public:
           root_context_ = static_cast<Context*>(create_root(wasm, plugin));
           return root_context_;
         });
+#endif
     wasm_ = plugin_handle_->wasmHandle();
   }
 
@@ -102,7 +118,13 @@ public:
   NiceMock<ThreadLocal::MockInstance> tls_;
   NiceMock<Event::MockDispatcher> dispatcher_;
   NiceMock<Upstream::MockClusterManager> cluster_manager_;
+#if defined(HIGRESS)
+  NiceMock<Runtime::MockLoader> runtime_;
+#endif
   NiceMock<Init::MockManager> init_manager_;
+#if defined(HIGRESS)
+  WasmHandleSharedPtr base_wasm_;
+#endif
   WasmHandleSharedPtr wasm_;
   PluginSharedPtr plugin_;
   PluginHandleSharedPtr plugin_handle_;

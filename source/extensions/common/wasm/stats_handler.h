@@ -3,6 +3,9 @@
 #include <memory>
 
 #include "envoy/server/lifecycle_notifier.h"
+#ifdef HIGRESS
+#include "envoy/stats/histogram.h"
+#endif
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats.h"
 #include "envoy/upstream/cluster_manager.h"
@@ -32,24 +35,35 @@ struct CreateWasmStats {
 };
 
 #ifdef HIGRESS
-#define LIFECYCLE_STATS(COUNTER, GAUGE, PLUGIN_COUNTER, PLUGIN_GAUGE)                              \
+#define LIFECYCLE_STATS(COUNTER, GAUGE, PLUGIN_COUNTER, PLUGIN_GAUGE, PLUGIN_HISTOGRAM)            \
   COUNTER(created)                                                                                 \
   GAUGE(active, NeverImport)                                                                       \
   PLUGIN_COUNTER(recover_total)                                                                    \
   PLUGIN_COUNTER(rebuild_total)                                                                    \
+  PLUGIN_COUNTER(rebuild_memory_total)                                                             \
+  PLUGIN_COUNTER(rebuild_explicit_total)                                                           \
   PLUGIN_COUNTER(crash_total)                                                                      \
   PLUGIN_COUNTER(recover_error)                                                                    \
-  PLUGIN_GAUGE(crash, NeverImport)
+  PLUGIN_GAUGE(crash, NeverImport)                                                                 \
+  PLUGIN_HISTOGRAM(reclaim_latency, Milliseconds)
 #else
 #define LIFECYCLE_STATS(COUNTER, GAUGE)                                                            \
   COUNTER(created)                                                                                 \
   GAUGE(active, NeverImport)
 #endif
 
+#ifdef HIGRESS
+#define RUNTIME_STATS(PLUGIN_GAUGE) PLUGIN_GAUGE(memory_size, NeverImport)
+
+struct RuntimeStats {
+  RUNTIME_STATS(GENERATE_GAUGE_STRUCT)
+};
+#endif
+
 struct LifecycleStats {
 #ifdef HIGRESS
   LIFECYCLE_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_COUNTER_STRUCT,
-                  GENERATE_GAUGE_STRUCT)
+                  GENERATE_GAUGE_STRUCT, GENERATE_HISTOGRAM_STRUCT)
 #else
   LIFECYCLE_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT)
 #endif
@@ -116,8 +130,9 @@ public:
             POOL_GAUGE_PREFIX(*scope, absl::StrCat("wasm.", runtime, ".")),
             POOL_COUNTER_PREFIX(*scope,
                                 absl::StrCat("wasm.", runtime, ".plugin.", plugin_name, ".")),
-            POOL_GAUGE_PREFIX(*scope,
-                              absl::StrCat("wasm.", runtime, ".plugin.", plugin_name, ".")))}){};
+            POOL_GAUGE_PREFIX(*scope, absl::StrCat("wasm.", runtime, ".plugin.", plugin_name, ".")),
+            POOL_HISTOGRAM_PREFIX(
+                *scope, absl::StrCat("wasm.", runtime, ".plugin.", plugin_name, ".")))}){};
 #else
   LifecycleStatsHandler(const Stats::ScopeSharedPtr& scope, std::string runtime)
       : lifecycle_stats_(LifecycleStats{
@@ -139,6 +154,27 @@ protected:
   bool is_crashed_ = false;
 #endif
 };
+
+#ifdef HIGRESS
+class RuntimeStatsHandler {
+public:
+  RuntimeStatsHandler(const Stats::ScopeSharedPtr& scope, const std::string& runtime,
+                      const std::string& plugin_name, const std::string& thread_name)
+      : runtime(runtime), plugin_name(plugin_name),
+        runtime_stats_(RuntimeStats{RUNTIME_STATS(
+            POOL_GAUGE_PREFIX(*scope, absl::StrCat("wasm.", runtime, ".plugin.", plugin_name, ".",
+                                                   thread_name, ".")))}) {}
+
+  ~RuntimeStatsHandler() = default;
+
+  std::string runtime;
+  std::string plugin_name;
+  void updateMemorySize(uint64_t memory_size) { runtime_stats_.memory_size_.set(memory_size); }
+
+protected:
+  RuntimeStats runtime_stats_;
+};
+#endif
 
 } // namespace Wasm
 } // namespace Common

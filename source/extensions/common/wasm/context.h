@@ -320,6 +320,9 @@ protected:
 
   void addAfterVmCallAction(std::function<void()> f);
   void onCloseTCP();
+#if defined(HIGRESS)
+  void releaseActiveStream();
+#endif
 
   struct AsyncClientHandler : public Http::AsyncClient::Callbacks {
     // Http::AsyncClient::Callbacks
@@ -422,6 +425,9 @@ protected:
 
   const LocalInfo::LocalInfo* root_local_info_{nullptr}; // set only for root_context.
   PluginHandleSharedPtr plugin_handle_{nullptr};
+#if defined(HIGRESS)
+  bool active_stream_count_recorded_ = false;
+#endif
 
   uint32_t next_http_call_token_ = 1;
   uint32_t next_grpc_token_ = 1; // Odd tokens are for Calls even for Streams.

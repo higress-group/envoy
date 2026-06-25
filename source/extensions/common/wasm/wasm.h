@@ -8,6 +8,9 @@
 #include "envoy/common/exception.h"
 #include "envoy/extensions/wasm/v3/wasm.pb.validate.h"
 #include "envoy/http/filter.h"
+#if defined(HIGRESS)
+#include "envoy/runtime/runtime.h"
+#endif
 #include "envoy/server/lifecycle_notifier.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats.h"
@@ -27,6 +30,10 @@
 #include "include/proxy-wasm/exports.h"
 #include "include/proxy-wasm/wasm.h"
 
+#if defined(HIGRESS)
+#include "absl/types/optional.h"
+#endif
+
 namespace Envoy {
 namespace Extensions {
 namespace Common {
@@ -41,8 +48,18 @@ class WasmHandle;
 class Wasm : public WasmBase, Logger::Loggable<Logger::Id::wasm> {
 public:
   Wasm(WasmConfig& config, absl::string_view vm_key, const Stats::ScopeSharedPtr& scope,
-       Api::Api& api, Upstream::ClusterManager& cluster_manager, Event::Dispatcher& dispatcher);
-  Wasm(std::shared_ptr<WasmHandle> other, Event::Dispatcher& dispatcher);
+       Api::Api& api, Upstream::ClusterManager& cluster_manager, Event::Dispatcher& dispatcher
+#if defined(HIGRESS)
+       ,
+       Runtime::Loader* runtime = nullptr
+#endif
+  );
+  Wasm(std::shared_ptr<WasmHandle> other, Event::Dispatcher& dispatcher
+#if defined(HIGRESS)
+       ,
+       Runtime::Loader* runtime = nullptr
+#endif
+  );
   ~Wasm() override;
 
   Upstream::ClusterManager& clusterManager() const { return cluster_manager_; }
@@ -76,6 +93,17 @@ public:
   virtual std::string buildVersion() { return BUILD_VERSION_NUMBER; }
 
   void initializeLifecycle(Server::ServerLifecycleNotifier& lifecycle_notifier);
+
+#if defined(HIGRESS)
+  void initializeRuntimeStatsTimer();
+  uint64_t reclaimMemoryThreshold() const;
+  void markReclaimEligible();
+  void clearReclaimEligible() { reclaim_eligible_since_.reset(); }
+  const absl::optional<MonotonicTime>& reclaimEligibleSinceForTesting() const {
+    return reclaim_eligible_since_;
+  }
+#endif
+
   uint32_t nextDnsToken() {
     do {
       dns_token_++;
@@ -92,6 +120,17 @@ public:
 
 #if defined(HIGRESS)
   LifecycleStats& lifecycleStats() { return lifecycle_stats_handler_.stats(); }
+  void recordReclaimLatency(MonotonicTime now);
+  void incrementActiveStreamCount() { ++active_stream_count_; }
+  void decrementActiveStreamCount() {
+    ASSERT(active_stream_count_ > 0);
+    if (active_stream_count_ == 0) {
+      ENVOY_LOG(error, "wasm active stream count underflow");
+      return;
+    }
+    --active_stream_count_;
+  }
+  uint64_t activeStreamCount() const { return active_stream_count_; }
 #endif
 
 protected:
@@ -111,6 +150,16 @@ protected:
   Event::PostCb server_shutdown_post_cb_;
   absl::flat_hash_map<uint32_t, Event::TimerPtr> timer_; // per root_id.
   TimeSource& time_source_;
+
+#if defined(HIGRESS)
+  // Runtime stats
+  RuntimeStatsHandler runtime_stats_handler_;
+  Event::TimerPtr runtime_stats_timer_;
+  static constexpr std::chrono::milliseconds kRuntimeStatsInterval{1000};
+  uint64_t active_stream_count_ = 0;
+  Runtime::Loader* runtime_loader_;
+  absl::optional<MonotonicTime> reclaim_eligible_since_;
+#endif
 
   // Lifecycle stats
   LifecycleStatsHandler lifecycle_stats_handler_;
@@ -158,11 +207,17 @@ private:
 using PluginHandleSharedPtr = std::shared_ptr<PluginHandle>;
 
 #if defined(HIGRESS)
+enum class RebuildSource { Explicit, Memory };
+
 class PluginHandleSharedPtrThreadLocal : public ThreadLocal::ThreadLocalObject,
                                          public Logger::Loggable<Logger::Id::wasm> {
 public:
-  PluginHandleSharedPtrThreadLocal(PluginHandleSharedPtr handle) : handle_(handle){};
-  bool rebuild(bool is_fail_recovery = false);
+  PluginHandleSharedPtrThreadLocal(PluginHandleSharedPtr handle,
+                                   WasmHandleSharedPtr base_wasm = nullptr,
+                                   bool enable_reclaim_timer = false);
+  ~PluginHandleSharedPtrThreadLocal() override;
+  bool rebuild(bool is_fail_recovery = false, RebuildSource source = RebuildSource::Explicit);
+  void runReclaimTimerForTesting();
 #else
 class PluginHandleSharedPtrThreadLocal : public ThreadLocal::ThreadLocalObject {
 public:
@@ -171,11 +226,17 @@ public:
   PluginHandleSharedPtr& handle() { return handle_; }
 
 private:
-  PluginHandleSharedPtr handle_;
 #if defined(HIGRESS)
-  MonotonicTime last_recover_time_;
-  std::weak_ptr<PluginHandle> old_handle_;
+  void initializeReclaimTimer();
+  void onReclaimTimer();
+  bool syncHandleToCurrentGeneration(const std::string& vm_key);
+  PluginSharedPtr plugin_;
+  WasmHandleSharedPtr base_wasm_;
+  Event::TimerPtr reclaim_timer_;
+  bool reclaim_timer_enabled_;
+  static constexpr std::chrono::milliseconds kReclaimTimerInterval{1000};
 #endif
+  PluginHandleSharedPtr handle_;
 };
 
 using CreateWasmCallback = std::function<void(WasmHandleSharedPtr)>;
@@ -190,7 +251,12 @@ bool createWasm(const PluginSharedPtr& plugin, const Stats::ScopeSharedPtr& scop
                 Envoy::Server::ServerLifecycleNotifier& lifecycle_notifier,
                 Config::DataSource::RemoteAsyncDataProviderPtr& remote_data_provider,
                 CreateWasmCallback&& callback,
-                CreateContextFn create_root_context_for_testing = nullptr);
+                CreateContextFn create_root_context_for_testing = nullptr
+#if defined(HIGRESS)
+                ,
+                Runtime::Loader* runtime = nullptr
+#endif
+);
 
 PluginHandleSharedPtr
 getOrCreateThreadLocalPlugin(const WasmHandleSharedPtr& base_wasm, const PluginSharedPtr& plugin,
@@ -199,6 +265,9 @@ getOrCreateThreadLocalPlugin(const WasmHandleSharedPtr& base_wasm, const PluginS
 
 void clearCodeCacheForTesting();
 void setTimeOffsetForCodeCacheForTesting(MonotonicTime::duration d);
+#if defined(HIGRESS)
+size_t rebuildGuardRegistrySizeForTesting();
+#endif
 WasmEvent toWasmEvent(const std::shared_ptr<WasmHandleBase>& wasm);
 
 } // namespace Wasm

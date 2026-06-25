@@ -56,17 +56,6 @@ public:
         ENVOY_LOG(info, "wasm vm recover failed");
         failed = true;
       }
-    } else if (wasm->shouldRebuild()) {
-      ENVOY_LOG(info, "wasm vm requested rebuild, try to rebuild");
-      if (opt_ref->rebuild(false)) {
-        ENVOY_LOG(info, "wasm vm rebuild success");
-        wasm = opt_ref->handle()->wasmHandle()->wasm().get();
-        handle = opt_ref->handle();
-        // Reset rebuild state
-        wasm->setShouldRebuild(false);
-      } else {
-        ENVOY_LOG(info, "wasm vm rebuild failed, still using the stale one");
-      }
     }
     if (failed) {
       if (handle->plugin()->fail_open_) {
@@ -92,7 +81,9 @@ public:
 private:
   ThreadLocal::TypedSlotPtr<PluginHandleSharedPtrThreadLocal> tls_slot_;
   Config::DataSource::RemoteAsyncDataProviderPtr remote_data_provider_;
+#if defined(HIGRESS)
   Envoy::Extensions::Common::Wasm::WasmHandleSharedPtr base_wasm_handle_;
+#endif
 };
 
 using FilterConfigSharedPtr = std::shared_ptr<FilterConfig>;
