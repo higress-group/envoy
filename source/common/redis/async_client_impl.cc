@@ -51,7 +51,25 @@ AsyncClientImpl::~AsyncClientImpl() {
   }
 }
 
+bool AsyncClientImpl::currentConfigEquals(const AsyncClientConfig& incoming) const {
+  // config_ holds the numeric/bool fields; auth/params live on this instance.
+  return auth_username_ == incoming.auth_username_ &&
+         auth_password_ == incoming.auth_password_ && params_ == incoming.params_ &&
+         config_->opTimeout() == incoming.op_timeout_ &&
+         config_->maxBufferSizeBeforeFlush() == incoming.max_buffer_size_before_flush_ &&
+         config_->bufferFlushTimeoutInMs() == incoming.buffer_flush_timeout_ &&
+         config_->maxUpstreamUnknownConnections() == incoming.max_upstream_unknown_connections_ &&
+         config_->enableCommandStats() == incoming.enable_command_stats_;
+}
+
 void AsyncClientImpl::initialize(AsyncClientConfig config) {
+  // Reloading a plugin re-invokes initialize() with the same Redis config. Tearing
+  // down healthy connections in that case fails in-flight requests during the lazy
+  // reconnect window (see higress #4086). Skip teardown when nothing changed.
+  if (initialized_ && currentConfigEquals(config)) {
+    return;
+  }
+
   while (!client_map_.empty()) {
     client_map_.begin()->second->redis_client_->close();
   }
@@ -63,6 +81,7 @@ void AsyncClientImpl::initialize(AsyncClientConfig config) {
   auth_username_ = config.auth_username_;
   auth_password_ = config.auth_password_;
   params_ = config.params_;
+  initialized_ = true;
 }
 
 PoolRequest* AsyncClientImpl::send(std::string&& query, AsyncClient::Callbacks& callbacks,
