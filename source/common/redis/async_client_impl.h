@@ -139,6 +139,11 @@ private:
 
   void onRequestCompleted();
 
+  // Returns true when `incoming` equals the currently installed configuration
+  // (the auth/params members plus the fields held by `config_`). Used by
+  // initialize() to skip connection teardown when nothing changed.
+  bool currentConfigEquals(const AsyncClientConfig& incoming) const;
+
   const std::string cluster_name_;
   Upstream::ThreadLocalCluster* cluster_{};
   Event::Dispatcher& dispatcher_;
@@ -155,6 +160,10 @@ private:
   Event::TimerPtr drain_timer_;
   RawClientFactory& client_factory_;
   ConfigSharedPtr config_;
+  // False until the first initialize() installs a real config. config_ is
+  // non-null from construction (default ConfigImpl), so this flag -- not a null
+  // check -- is what distinguishes the first call from a reload.
+  bool initialized_{false};
   Stats::ScopeSharedPtr stats_scope_;
   RedisCommandStatsSharedPtr redis_command_stats_;
   RedisClusterStats redis_cluster_stats_;
