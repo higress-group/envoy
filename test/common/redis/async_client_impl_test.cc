@@ -7,6 +7,7 @@
 #include "source/common/stats/isolated_store_impl.h"
 
 #include "test/mocks/event/mocks.h"
+#include "test/mocks/redis/mocks.h"
 #include "test/mocks/upstream/host.h"
 #include "test/mocks/upstream/thread_local_cluster.h"
 
@@ -100,11 +101,15 @@ public:
     EXPECT_EQ(factory_.created_, 1);
   }
 
+  // close_count_ and factory_ are declared before dispatcher_ so they outlive it:
+  // dispatcher_.deferredDelete() retains FakeRawClients in its to_delete_ vector, and
+  // those hold `int& close_count_`. Destruction is reverse-declaration order, so this
+  // ordering guarantees dispatcher_ (and the FakeRawClients it owns) tears down first.
   NiceMock<Upstream::MockThreadLocalCluster> cluster_;
-  NiceMock<Event::MockDispatcher> dispatcher_;
-  Stats::IsolatedStoreImpl stats_;
   int close_count_{0};
   FakeRawClientFactory factory_{close_count_};
+  NiceMock<Event::MockDispatcher> dispatcher_;
+  Stats::IsolatedStoreImpl stats_;
   std::shared_ptr<Upstream::MockHost> host_;
   MockRedisAsyncClientCallbacks callbacks_;
   std::unique_ptr<AsyncClientImpl> client_;
@@ -120,12 +125,11 @@ TEST_F(AsyncClientImplTest, IdenticalConfigSkipsTeardown) {
   EXPECT_EQ(close_count_, 0);        // connection preserved
 }
 
-// SPEC-001: the first initialize() always installs, even if it equals ConfigImpl defaults.
+// SPEC-001: the first initialize() always installs (initialized_ is false), then a
+// subsequent identical call short-circuits.
 TEST_F(AsyncClientImplTest, FirstCallInstallsThenShortCircuits) {
-  // Defaults happen to match ConfigImpl's constructed values; the initialized_ flag,
-  // not value coincidence, is what forces the first call through the install path.
-  auto default_like = makeConfig("", "", 1000, {});
-  client_->initialize(default_like);
+  auto empty_auth = makeConfig("", "", 1000, {});
+  client_->initialize(empty_auth);
   openOneClient();
 
   close_count_ = 0;
