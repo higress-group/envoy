@@ -6,8 +6,8 @@
 #include "envoy/http/codes.h"
 #include "envoy/http/query_params.h"
 
-#include "source/common/common/assert.h"
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/assert.h"
 #include "source/common/common/enum_to_int.h"
 #include "source/common/common/regex.h"
 
@@ -29,7 +29,8 @@ absl::optional<json> DubboUtility::convertStringToTypeValue(absl::string_view va
       return {json(value == "true" ? true : false)};
     }
     return absl::nullopt;
-  } else if (type == JsonType2JavaType.at(json::value_t::number_float)) {
+  } else if (type == JsonType2JavaType.at(json::value_t::number_float) ||
+             type == "java.lang.Float" || type == "java.math.BigDecimal") {
     envoy::type::matcher::v3::RegexMatcher matcher;
     *matcher.mutable_google_re2() = envoy::type::matcher::v3::RegexMatcher::GoogleRE2();
     matcher.set_regex("^-?([1-9]\\d*\\.\\d*|0\\.\\d*[1-9]\\d*|0?\\.0+|0)$");
@@ -39,7 +40,8 @@ absl::optional<json> DubboUtility::convertStringToTypeValue(absl::string_view va
       return absl::nullopt;
     }
     return {json(strtod(value.data(), nullptr))};
-  } else if (type == JsonType2JavaType.at(json::value_t::number_integer)) {
+  } else if (type == JsonType2JavaType.at(json::value_t::number_integer) ||
+             type == "java.lang.Integer" || type == "java.lang.Short" || type == "java.util.Date") {
     envoy::type::matcher::v3::RegexMatcher matcher;
     *matcher.mutable_google_re2() = envoy::type::matcher::v3::RegexMatcher::GoogleRE2();
     matcher.set_regex("^(0|[1-9][0-9]*|-[1-9][0-9]*)$");
@@ -51,7 +53,7 @@ absl::optional<json> DubboUtility::convertStringToTypeValue(absl::string_view va
     return {json(strtoll(value.data(), nullptr, 10))};
   } else if (type == JsonType2JavaType.at(json::value_t::string)) {
     return {json(value)};
-  } else if (type == JsonType2JavaType.at(json::value_t::array)) {
+  } else if (type == JsonType2JavaType.at(json::value_t::array) || type == "java.util.Set") {
     json array_json;
     array_json.emplace_back(std::string(value));
     return array_json;
@@ -273,7 +275,8 @@ json DubboUtility::hessian2Json(Object* input) {
     if (dynamic_cast<Hessian2::ClassInstanceObject*>(input) == nullptr) {
       out = badCastErrorMessageJson(hessianType2String(input->type()));
     } else {
-      auto class_instance_ref = static_cast<Hessian2::ClassInstanceObject*>(input)->toClassInstance();
+      auto class_instance_ref =
+          static_cast<Hessian2::ClassInstanceObject*>(input)->toClassInstance();
       const Hessian2::Object::ClassInstance* class_instance = &(*class_instance_ref).get();
       RELEASE_ASSERT(class_instance->def_->field_names_.size() == class_instance->data_.size(),
                      "The size of def_->field_names_ and data_ of class_instance is inconsistent");
