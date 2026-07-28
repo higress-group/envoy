@@ -1,14 +1,14 @@
 #include <fstream>
+
 #include "test/mocks/server/factory_context.h"
-#include "test/test_common/utility.h"
 #include "test/test_common/environment.h"
+#include "test/test_common/utility.h"
 
 #include "contrib/envoy/extensions/filters/http/http_dubbo_transcoder/v3/http_dubbo_transcoder.pb.h"
 #include "contrib/envoy/extensions/filters/http/http_dubbo_transcoder/v3/http_dubbo_transcoder.pb.validate.h"
 #include "contrib/http_dubbo_transcoder/filters/http/source/config.h"
 #include "contrib/http_dubbo_transcoder/filters/http/source/dubbo_transcoder_filter.h"
 #include "contrib/http_dubbo_transcoder/filters/http/source/utility.h"
-
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "hessian2/object.hpp"
@@ -54,8 +54,8 @@ services_mapping:
     TestUtility::loadFromYaml(yaml_string, proto_config);
 
     time_system_.setSystemTime(std::chrono::seconds(1610503040));
-    config_ =
-        std::make_shared<DubboTranscoderConfig>(proto_config, "http_dubbo_transcoder", *scope_.rootScope());
+    config_ = std::make_shared<DubboTranscoderConfig>(proto_config, "http_dubbo_transcoder",
+                                                      *scope_.rootScope());
   }
 
   void setFilter() { setFilter(std::make_shared<TranscodeFilter>(*config_)); }
@@ -96,7 +96,7 @@ TEST_F(TranscodeFilterTest, NormalHttpGetMethod) {
   setConfiguration();
   setFilter();
 
-  EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(1);
+  EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true));
 
   Http::TestRequestHeaderMapImpl request_headers{
       {":method", "GET"}, {":path", "/mytest.service/sayHello?my_param=test"}};
@@ -154,7 +154,7 @@ services_mapping:
   {
     // the path mismatch.
     EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(0);
-    EXPECT_CALL(decoder_callbacks_, sendLocalReply(_, _, _, _, _)).Times(1);
+    EXPECT_CALL(decoder_callbacks_, sendLocalReply(_, _, _, _, _));
     Http::TestRequestHeaderMapImpl request_headers{{":method", "POST"},
                                                    {":path", "/mytest.service/test?my_param=test"}};
     EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,
@@ -165,7 +165,7 @@ services_mapping:
   {
     // the parameter mismatch.
     EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(0);
-    EXPECT_CALL(decoder_callbacks_, sendLocalReply(_, _, _, _, _)).Times(1);
+    EXPECT_CALL(decoder_callbacks_, sendLocalReply(_, _, _, _, _));
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "GET"}, {":path", "/mytest.service/sayHello?my_test=test"}};
     EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,
@@ -203,7 +203,7 @@ services_mapping:
   {
     // normal request
     EXPECT_CALL(decoder_callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
-    EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(1);
+    EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true));
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "GET"}, {":path", "/mytest.service/sayHello?my_param1=test&my_param2=12345"}};
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
@@ -211,8 +211,7 @@ services_mapping:
   }
   {
     // the request path don't include a query
-    EXPECT_CALL(decoder_callbacks_, sendLocalReply(Http::Code::InternalServerError, _, _, _, _))
-        .Times(1);
+    EXPECT_CALL(decoder_callbacks_, sendLocalReply(Http::Code::InternalServerError, _, _, _, _));
     EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(0);
     Http::TestRequestHeaderMapImpl request_headers{{":method", "GET"},
                                                    {":path", "/mytest.service/sayHello"}};
@@ -223,7 +222,7 @@ services_mapping:
 
   {
     // query key don't match the extract_key
-    EXPECT_CALL(decoder_callbacks_, sendLocalReply(Http::Code::NotFound, _, _, _, _)).Times(1);
+    EXPECT_CALL(decoder_callbacks_, sendLocalReply(Http::Code::NotFound, _, _, _, _));
     EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(0);
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "GET"}, {":path", "/mytest.service/sayHello?my_param1=test&my_param4=45645"}};
@@ -261,7 +260,7 @@ services_mapping:
   {
     // normal request
     EXPECT_CALL(decoder_callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
-    EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(1);
+    EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true));
     Http::TestRequestHeaderMapImpl request_headers{{":method", "GET"},
                                                    {":path", "/mytest.service/sayHello"},
                                                    {"my_param1", "test"},
@@ -271,7 +270,7 @@ services_mapping:
   }
   {
     // extract_key my_param1 cannot be found in headers
-    EXPECT_CALL(decoder_callbacks_, sendLocalReply(Http::Code::NotFound, _, _, _, _)).Times(1);
+    EXPECT_CALL(decoder_callbacks_, sendLocalReply(Http::Code::NotFound, _, _, _, _));
     EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(0);
     Http::TestRequestHeaderMapImpl request_headers{{":method", "GET"},
                                                    {":path", "/mytest.service/sayHello"},
@@ -283,7 +282,7 @@ services_mapping:
   }
   {
     // my_param2's mapping type is Double, but given String
-    EXPECT_CALL(decoder_callbacks_, sendLocalReply(Http::Code::BadRequest, _, _, _, _)).Times(1);
+    EXPECT_CALL(decoder_callbacks_, sendLocalReply(Http::Code::BadRequest, _, _, _, _));
     EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(0);
     Http::TestRequestHeaderMapImpl request_headers{{":method", "GET"},
                                                    {":path", "/mytest.service/sayHello"},
@@ -318,7 +317,7 @@ services_mapping:
   {
     // normal request
     EXPECT_CALL(decoder_callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
-    EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(1);
+    EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true));
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "GET"}, {":path", "/common.sayHello/sayHello"}, {"my_param1", "test"}};
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
@@ -327,7 +326,7 @@ services_mapping:
 
   {
     // extract_key my_param1 cannot be found in headers
-    EXPECT_CALL(decoder_callbacks_, sendLocalReply(Http::Code::NotFound, _, _, _, _)).Times(1);
+    EXPECT_CALL(decoder_callbacks_, sendLocalReply(Http::Code::NotFound, _, _, _, _));
     EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(0);
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "GET"}, {":path", "/common.sayHello/sayHello"}, {"param", "test"}};
@@ -626,6 +625,38 @@ TEST(DobboUtilityTest, convertStringToTypeValueTest) {
     std::string type{"java.lang.Boolean"};
     nlohmann::json result = false;
     EXPECT_EQ(result, DubboUtility::convertStringToTypeValue(value, type).value());
+  }
+}
+
+TEST(DobboUtilityTest, ConvertAdditionalJavaTypes) {
+  for (const std::string& type : {"java.lang.Integer", "java.lang.Short", "java.util.Date"}) {
+    SCOPED_TRACE(type);
+    const auto result = DubboUtility::convertStringToTypeValue("-34534", type);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(nlohmann::json(-34534), result.value());
+  }
+
+  for (const std::string& type : {"java.lang.Float", "java.math.BigDecimal"}) {
+    SCOPED_TRACE(type);
+    const auto result = DubboUtility::convertStringToTypeValue("-0.234234", type);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(nlohmann::json(-0.234234), result.value());
+  }
+
+  const auto set_result = DubboUtility::convertStringToTypeValue("item", "java.util.Set");
+  ASSERT_TRUE(set_result.has_value());
+  EXPECT_EQ(nlohmann::json::array({"item"}), set_result.value());
+}
+
+TEST(DobboUtilityTest, RejectInvalidValuesForAdditionalJavaTypes) {
+  for (const std::string& type : {"java.lang.Integer", "java.lang.Short", "java.util.Date"}) {
+    SCOPED_TRACE(type);
+    EXPECT_FALSE(DubboUtility::convertStringToTypeValue("1.5", type).has_value());
+  }
+
+  for (const std::string& type : {"java.lang.Float", "java.math.BigDecimal"}) {
+    SCOPED_TRACE(type);
+    EXPECT_FALSE(DubboUtility::convertStringToTypeValue("not-a-number", type).has_value());
   }
 }
 
@@ -976,7 +1007,7 @@ services_mapping:
     setConfiguration(yaml_string);
     setFilter();
 
-    EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(1);
+    EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true));
 
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "GET"}, {":path", "/mytest.service/sayHello?my_param=test"}};
@@ -1006,7 +1037,7 @@ services_mapping:
     setConfiguration(yaml_string);
     setFilter();
 
-    EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(1);
+    EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true));
 
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "GET"}, {":path", "/mytest.service/sayHello?my_param=test"}};
@@ -1036,7 +1067,7 @@ services_mapping:
     setConfiguration(yaml_string);
     setFilter();
 
-    EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(1);
+    EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true));
 
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "GET"}, {":path", "/mytest.service/sayHello?my_param=test"}};
