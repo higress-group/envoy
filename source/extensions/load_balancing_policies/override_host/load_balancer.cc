@@ -200,7 +200,8 @@ OverrideHostLoadBalancer::LoadBalancerImpl::chooseHost(LoadBalancerContext* cont
 
 void OverrideHostLoadBalancer::LoadBalancerImpl::addSelectedHostKey(
     LoadBalancerContext* context, HostSelectionResponse& response) {
-  if (!config_.selectedHostKey().has_value() || response.host == nullptr) {
+  if (!config_.selectedHostKey().has_value() || response.host == nullptr || context == nullptr ||
+      context->requestStreamInfo() == nullptr) {
     return;
   }
 
