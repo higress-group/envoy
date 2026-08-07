@@ -48,11 +48,13 @@ using ::Envoy::Upstream::LoadBalancerPtr;
 using ::Envoy::Upstream::TypedLoadBalancerFactory;
 
 OverrideHostLbConfig::OverrideHostLbConfig(std::vector<OverrideSource>&& override_host_sources,
+                                           absl::optional<Config::MetadataKey>&& selected_host_key,
                                            TypedLoadBalancerFactory* fallback_load_balancer_factory,
                                            LoadBalancerConfigPtr&& fallback_load_balancer_config)
     : fallback_picker_lb_config_{fallback_load_balancer_factory,
                                  std::move(fallback_load_balancer_config)},
-      override_host_sources_(std::move(override_host_sources)) {}
+      override_host_sources_(std::move(override_host_sources)),
+      selected_host_key_(std::move(selected_host_key)) {}
 
 OverrideHostLbConfig::OverrideSource
 OverrideHostLbConfig::OverrideSource::make(const OverrideHost::OverrideHostSource& config) {
@@ -87,6 +89,12 @@ OverrideHostLbConfig::make(const OverrideHost& config, ServerFactoryContext& con
   absl::StatusOr<std::vector<OverrideSource>> override_host_sources =
       makeOverrideSources(config.override_host_sources());
   RETURN_IF_NOT_OK(override_host_sources.status());
+
+  absl::optional<Config::MetadataKey> selected_host_key;
+  if (config.has_selected_host_key()) {
+    selected_host_key.emplace(config.selected_host_key());
+  }
+
   ASSERT(config.has_fallback_policy());
   absl::InlinedVector<absl::string_view, 4> missing_policies;
   for (const auto& policy : config.fallback_policy().policies()) {
@@ -102,9 +110,9 @@ OverrideHostLbConfig::make(const OverrideHost& config, ServerFactoryContext& con
 
       auto fallback_load_balancer_config = factory->loadConfig(context, *proto_message);
       RETURN_IF_NOT_OK_REF(fallback_load_balancer_config.status());
-      return std::unique_ptr<OverrideHostLbConfig>(
-          new OverrideHostLbConfig(std::move(override_host_sources).value(), factory,
-                                   std::move(fallback_load_balancer_config.value())));
+      return std::unique_ptr<OverrideHostLbConfig>(new OverrideHostLbConfig(
+          std::move(override_host_sources).value(), std::move(selected_host_key), factory,
+          std::move(fallback_load_balancer_config.value())));
     }
     missing_policies.push_back(policy.typed_extension_config().name());
   }
@@ -145,7 +153,7 @@ OverrideHostLoadBalancer::LoadBalancerImpl::peekAnotherHost(LoadBalancerContext*
 }
 
 HostSelectionResponse
-OverrideHostLoadBalancer::LoadBalancerImpl::chooseHost(LoadBalancerContext* context) {
+OverrideHostLoadBalancer::LoadBalancerImpl::chooseHostInternal(LoadBalancerContext* context) {
   if (!context || !context->requestStreamInfo()) {
     // If there is no context or no request stream info, we can't use the
     // metadata, so we just return a host from the fallback picker.
@@ -166,7 +174,7 @@ OverrideHostLoadBalancer::LoadBalancerImpl::chooseHost(LoadBalancerContext* cont
   }
 
   if (override_host_state->empty()) {
-    ENVOY_LOG(trace, "No overriden hosts were found. Using fallback LB policy.");
+    ENVOY_LOG(trace, "No overridden hosts were found. Using fallback LB policy.");
     return fallback_picker_lb_->chooseHost(context);
   }
 
@@ -181,6 +189,39 @@ OverrideHostLoadBalancer::LoadBalancerImpl::chooseHost(LoadBalancerContext* cont
   ENVOY_LOG(trace, "Failed to find any endpoints from metadata in the cluster. "
                    "Using fallback LB policy.");
   return fallback_picker_lb_->chooseHost(context);
+}
+
+HostSelectionResponse
+OverrideHostLoadBalancer::LoadBalancerImpl::chooseHost(LoadBalancerContext* context) {
+  auto response = chooseHostInternal(context);
+  addSelectedHostKey(context, response);
+  return response;
+}
+
+void OverrideHostLoadBalancer::LoadBalancerImpl::addSelectedHostKey(
+    LoadBalancerContext* context, HostSelectionResponse& response) {
+  if (!config_.selectedHostKey().has_value() || response.host == nullptr) {
+    return;
+  }
+
+  const Config::MetadataKey& metadata_key = config_.selectedHostKey().value();
+  if (metadata_key.path_.empty()) {
+    // Should not be possible based on proto validation, catching anyways.
+    ENVOY_LOG(trace, "Path was not provided in selected_host_key.");
+    return;
+  }
+
+  Protobuf::Struct updated_metadata;
+  Protobuf::Struct* updated_metadata_ptr = &updated_metadata;
+  for (size_t i = 0; i + 1 < metadata_key.path_.size(); ++i) {
+    Protobuf::Value& current_value =
+        (*updated_metadata_ptr->mutable_fields())[metadata_key.path_[i]];
+    updated_metadata_ptr = current_value.mutable_struct_value();
+  }
+  (*updated_metadata_ptr->mutable_fields())[metadata_key.path_.back()].set_string_value(
+      response.host->address()->asString());
+
+  context->requestStreamInfo()->setDynamicMetadata(metadata_key.key_, updated_metadata);
 }
 
 absl::optional<absl::string_view>
