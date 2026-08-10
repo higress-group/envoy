@@ -224,6 +224,29 @@ TEST(OverrideHostLbonfigTest, FallbackLbCalledToChooseHost) {
   EXPECT_EQ(host->address()->asString(), "127.0.0.1:80");
 }
 
+TEST(OverrideHostLbonfigTest, ValidSelectedHostKey) {
+  NiceMock<Envoy::Server::Configuration::MockServerFactoryContext> context;
+  ::envoy::config::core::v3::TypedExtensionConfig config;
+  config.set_name("envoy.load_balancers.override_host");
+  OverrideHost config_msg;
+  config_msg.add_override_host_sources()->set_header("x-foo");
+
+  auto* metadata_key = config_msg.mutable_selected_host_key();
+  metadata_key->set_key("envoy.lb");
+  metadata_key->add_path()->set_key("x-gateway-destination-endpoint-served");
+
+  Config fallback_picker_config;
+  auto* typed_extension_config =
+      config_msg.mutable_fallback_policy()->add_policies()->mutable_typed_extension_config();
+  typed_extension_config->mutable_typed_config()->PackFrom(fallback_picker_config);
+  typed_extension_config->set_name("envoy.load_balancing_policies.override_host.test");
+
+  config.mutable_typed_config()->PackFrom(config_msg);
+  auto& factory = Utility::getAndCheckFactory<::Envoy::Upstream::TypedLoadBalancerFactory>(config);
+  auto result = factory.loadConfig(context, config_msg);
+  EXPECT_TRUE(result.ok());
+}
+
 } // namespace
 } // namespace OverrideHost
 } // namespace LoadBalancingPolicies
