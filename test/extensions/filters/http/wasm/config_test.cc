@@ -47,10 +47,15 @@ protected:
   void initializeForRemote() {
     retry_timer_ = new Event::MockTimer();
 
-    EXPECT_CALL(dispatcher_, createTimer_(_)).WillOnce(Invoke([this](Event::TimerCb timer_cb) {
-      retry_timer_cb_ = timer_cb;
-      return retry_timer_;
-    }));
+    EXPECT_CALL(dispatcher_, createTimer_(_))
+        .WillOnce(Invoke([this](Event::TimerCb timer_cb) {
+          retry_timer_cb_ = timer_cb;
+          return retry_timer_;
+        }))
+        // The Host canary clone initializes its own runtime-stats timer after the remote retry
+        // timer. Keep this fixture focused on retaining the retry callback while accepting those
+        // worker-local timers.
+        .WillRepeatedly(testing::ReturnNew<NiceMock<Event::MockTimer>>());
   }
 
   NiceMock<Server::Configuration::MockFactoryContext> context_;
@@ -951,6 +956,52 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmCreateFilter) {
   EXPECT_NE(filter_config->createFilter(), nullptr);
 }
 
+#if defined(HIGRESS)
+TEST_P(WasmFilterConfigTest, MainThreadTlsSlotUsesNeutralRoleOnHealthyPath) {
+  NiceMock<Envoy::ThreadLocal::MockInstance> threadlocal;
+  const std::string yaml = TestEnvironment::substitute(absl::StrCat(R"EOF(
+  config:
+    name: main_role_test
+    vm_config:
+      runtime: "envoy.wasm.runtime.)EOF",
+                                                                    std::get<0>(GetParam()), R"EOF("
+      configuration:
+         "@type": "type.googleapis.com/google.protobuf.StringValue"
+         value: "some configuration"
+      code:
+        local:
+          filename: "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"
+  )EOF"));
+
+  envoy::extensions::filters::http::wasm::v3::Wasm proto_config;
+  TestUtility::loadFromYaml(yaml, proto_config);
+  EXPECT_CALL(context_, threadLocal()).WillOnce(ReturnRef(threadlocal));
+  EXPECT_CALL(context_, mainThreadDispatcher()).WillRepeatedly(ReturnRef(threadlocal.dispatcher_));
+  auto filter_config = std::make_unique<FilterConfig>(proto_config, context_);
+  ASSERT_EQ(threadlocal.current_slot_, 1);
+  auto wrapper = std::dynamic_pointer_cast<PluginHandleSharedPtrThreadLocal>(threadlocal.data_[0]);
+  ASSERT_NE(wrapper, nullptr);
+  EXPECT_FALSE(wrapper->participatesInWorkerInitialization());
+  EXPECT_EQ(Envoy::Extensions::Common::Wasm::PluginInitializationState::Ready,
+            wrapper->initializationState());
+  EXPECT_NE(wrapper->handle(), nullptr);
+  EXPECT_NE(wrapper->handle()->wasmHandle(), nullptr);
+
+  const std::string stats_prefix =
+      absl::StrCat("wasm.", proto_config.config().vm_config().runtime(), ".plugin.main_role_test.");
+  EXPECT_EQ(
+      0,
+      stats_scope_.counterFromString(stats_prefix + "worker_init_retryable_failure_total").value());
+  EXPECT_EQ(
+      0,
+      stats_scope_.counterFromString(stats_prefix + "worker_init_terminal_failure_total").value());
+  EXPECT_EQ(0, stats_scope_
+                   .gaugeFromString(stats_prefix + "worker_uninitialized",
+                                    Stats::Gauge::ImportMode::NeverImport)
+                   .value());
+}
+#endif
+
 TEST_P(WasmFilterConfigTest, FailedToGetThreadLocalPlugin) {
   NiceMock<Envoy::ThreadLocal::MockInstance> threadlocal;
   const std::string yaml = TestEnvironment::substitute(absl::StrCat(R"EOF(
@@ -969,15 +1020,140 @@ TEST_P(WasmFilterConfigTest, FailedToGetThreadLocalPlugin) {
 
   envoy::extensions::filters::http::wasm::v3::Wasm proto_config;
   TestUtility::loadFromYaml(yaml, proto_config);
+#if defined(HIGRESS)
+  proto_config.mutable_config()->set_name("worker_init_test");
+#endif
   EXPECT_CALL(context_, threadLocal()).WillOnce(ReturnRef(threadlocal));
   threadlocal.registered_ = true;
   auto filter_config = std::make_unique<FilterConfig>(proto_config, context_);
   ASSERT_EQ(threadlocal.current_slot_, 1);
   ASSERT_NE(filter_config->createFilter(), nullptr);
+#if defined(HIGRESS)
+  auto ready_wrapper =
+      std::dynamic_pointer_cast<PluginHandleSharedPtrThreadLocal>(threadlocal.data_[0]);
+  ASSERT_NE(ready_wrapper, nullptr);
+  EXPECT_TRUE(ready_wrapper->participatesInWorkerInitialization());
+  const auto recovered_handle = ready_wrapper->handle();
+  ASSERT_NE(recovered_handle, nullptr);
+#endif
 
   // If the thread local plugin handle returns nullptr, `createFilter` should return nullptr
   threadlocal.data_[0] = std::make_shared<PluginHandleSharedPtrThreadLocal>(nullptr);
   EXPECT_EQ(filter_config->createFilter(), nullptr);
+
+#if defined(HIGRESS)
+  auto worker_scope = Stats::ScopeSharedPtr(stats_store_.createScope(""));
+  auto worker_stats = std::make_shared<Envoy::Extensions::Common::Wasm::WorkerInitStatsHandler>(
+      worker_scope, proto_config.config().vm_config().runtime(), proto_config.config().name());
+  auto fail_open_plugin = std::make_shared<Envoy::Extensions::Common::Wasm::Plugin>(
+      proto_config.config(), context_.direction(), context_.localInfo(),
+      &context_.listenerMetadata());
+  const std::string stats_prefix = absl::StrCat(
+      "wasm.", proto_config.config().vm_config().runtime(), ".plugin.worker_init_test.");
+  auto& fail_open_skip =
+      worker_scope->counterFromString(stats_prefix + "worker_fail_open_skip_total");
+  auto& retry_total = worker_scope->counterFromString(stats_prefix + "worker_init_retry_total");
+  auto& recovered_total =
+      worker_scope->counterFromString(stats_prefix + "worker_init_recovered_total");
+  auto& uninitialized = worker_scope->gaugeFromString(stats_prefix + "worker_uninitialized",
+                                                      Stats::Gauge::ImportMode::NeverImport);
+
+  uint64_t factory_calls = 0;
+  auto retryable_wrapper = std::make_shared<PluginHandleSharedPtrThreadLocal>(
+      Envoy::Extensions::Common::Wasm::ThreadLocalPluginResult{nullptr,
+                                                               proxy_wasm::FailState::RuntimeError},
+      fail_open_plugin, nullptr, dispatcher_, worker_stats, false,
+      [&factory_calls, &recovered_handle]() {
+        ++factory_calls;
+        if (factory_calls == 1) {
+          return Envoy::Extensions::Common::Wasm::ThreadLocalPluginResult{
+              nullptr, proxy_wasm::FailState::RuntimeError};
+        }
+        return Envoy::Extensions::Common::Wasm::ThreadLocalPluginResult{recovered_handle,
+                                                                        proxy_wasm::FailState::Ok};
+      });
+  retryable_wrapper->setRecoveryVmKeyForTesting(
+      std::string(recovered_handle->wasmHandle()->wasm()->vm_key()));
+  threadlocal.data_[0] = retryable_wrapper;
+  EXPECT_EQ(filter_config->createFilter(), nullptr);
+  EXPECT_EQ(1, factory_calls);
+  EXPECT_EQ(1, retry_total.value());
+  EXPECT_EQ(1, fail_open_skip.value());
+  EXPECT_EQ(1, uninitialized.value());
+
+  EXPECT_EQ(filter_config->createFilter(), nullptr);
+  EXPECT_EQ(1, factory_calls);
+  EXPECT_EQ(1, retry_total.value());
+  EXPECT_EQ(2, fail_open_skip.value());
+
+  Envoy::Extensions::Common::Wasm::setTimeOffsetForCodeCacheForTesting(std::chrono::seconds(1));
+  auto recovered_filter = filter_config->createFilter();
+  EXPECT_NE(recovered_filter, nullptr);
+  EXPECT_EQ(2, factory_calls);
+  EXPECT_EQ(2, retry_total.value());
+  EXPECT_EQ(1, recovered_total.value());
+  EXPECT_EQ(0, uninitialized.value());
+  EXPECT_FALSE(retryable_wrapper->rebuild(true));
+
+  threadlocal.data_[0] = std::make_shared<PluginHandleSharedPtrThreadLocal>(
+      Envoy::Extensions::Common::Wasm::ThreadLocalPluginResult{
+          nullptr, proxy_wasm::FailState::ConfigureFailed},
+      fail_open_plugin, nullptr, dispatcher_, worker_stats);
+  EXPECT_EQ(filter_config->createFilter(), nullptr);
+  EXPECT_EQ(3, fail_open_skip.value());
+  EXPECT_EQ(1, uninitialized.value());
+
+  auto fail_closed_config = proto_config.config();
+  fail_closed_config.set_fail_open(false);
+  auto fail_closed_plugin = std::make_shared<Envoy::Extensions::Common::Wasm::Plugin>(
+      fail_closed_config, context_.direction(), context_.localInfo(), &context_.listenerMetadata());
+  uint64_t fail_closed_factory_calls = 0;
+  auto fail_closed_retryable = std::make_shared<PluginHandleSharedPtrThreadLocal>(
+      Envoy::Extensions::Common::Wasm::ThreadLocalPluginResult{nullptr,
+                                                               proxy_wasm::FailState::RuntimeError},
+      fail_closed_plugin, nullptr, dispatcher_, worker_stats, false,
+      [&fail_closed_factory_calls]() {
+        ++fail_closed_factory_calls;
+        return Envoy::Extensions::Common::Wasm::ThreadLocalPluginResult{
+            nullptr, proxy_wasm::FailState::RuntimeError};
+      });
+  fail_closed_retryable->setRecoveryVmKeyForTesting("config-fail-closed-recovery");
+  threadlocal.data_[0] = fail_closed_retryable;
+  EXPECT_NE(filter_config->createFilter(), nullptr);
+  EXPECT_EQ(1, fail_closed_factory_calls);
+  EXPECT_EQ(3, retry_total.value());
+  EXPECT_EQ(1, uninitialized.value());
+
+  threadlocal.data_[0] = std::make_shared<PluginHandleSharedPtrThreadLocal>(
+      Envoy::Extensions::Common::Wasm::ThreadLocalPluginResult{
+          nullptr, proxy_wasm::FailState::ConfigureFailed},
+      fail_closed_plugin, nullptr, dispatcher_, worker_stats);
+  auto fail_closed_filter = filter_config->createFilter();
+  ASSERT_NE(fail_closed_filter, nullptr);
+  Http::MockStreamDecoderFilterCallbacks decoder_callbacks;
+  fail_closed_filter->setDecoderFilterCallbacks(decoder_callbacks);
+  EXPECT_CALL(decoder_callbacks,
+              sendLocalReply(Envoy::Http::Code::ServiceUnavailable, testing::Eq(""), _,
+                             testing::Eq(Grpc::Status::WellKnownGrpcStatus::Unavailable),
+                             testing::Eq("wasm_fail_stream")))
+      .WillOnce(testing::InvokeWithoutArgs([&fail_closed_filter]() {
+        Http::TestResponseHeaderMapImpl response_headers{{":status", "503"}};
+        EXPECT_EQ(Http::FilterHeadersStatus::Continue,
+                  fail_closed_filter->encodeHeaders(response_headers, true));
+      }));
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"}, {":path", "/"}, {":scheme", "http"}, {":authority", "host"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,
+            fail_closed_filter->decodeHeaders(request_headers, true));
+  EXPECT_EQ(3, fail_open_skip.value());
+  EXPECT_EQ(2, uninitialized.value());
+
+  fail_closed_retryable.reset();
+  EXPECT_EQ(1, uninitialized.value());
+
+  threadlocal.data_[0] = std::make_shared<PluginHandleSharedPtrThreadLocal>(nullptr);
+  EXPECT_EQ(0, uninitialized.value());
+#endif
 }
 
 } // namespace Wasm

@@ -3,6 +3,7 @@
 #include <memory>
 
 #include "envoy/server/lifecycle_notifier.h"
+
 #ifdef HIGRESS
 #include "envoy/stats/histogram.h"
 #endif
@@ -55,8 +56,20 @@ struct CreateWasmStats {
 #ifdef HIGRESS
 #define RUNTIME_STATS(PLUGIN_GAUGE) PLUGIN_GAUGE(memory_size, NeverImport)
 
+#define WORKER_INIT_STATS(COUNTER, GAUGE)                                                          \
+  COUNTER(worker_init_retryable_failure_total)                                                     \
+  COUNTER(worker_init_terminal_failure_total)                                                      \
+  COUNTER(worker_init_retry_total)                                                                 \
+  COUNTER(worker_init_recovered_total)                                                             \
+  COUNTER(worker_fail_open_skip_total)                                                             \
+  GAUGE(worker_uninitialized, NeverImport)
+
 struct RuntimeStats {
   RUNTIME_STATS(GENERATE_GAUGE_STRUCT)
+};
+
+struct WorkerInitStats {
+  WORKER_INIT_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT)
 };
 #endif
 
@@ -174,6 +187,27 @@ public:
 protected:
   RuntimeStats runtime_stats_;
 };
+
+class WorkerInitStatsHandler {
+public:
+  WorkerInitStatsHandler(const Stats::ScopeSharedPtr& scope, const std::string& runtime,
+                         const std::string& plugin_name)
+      : scope_(scope),
+        worker_init_stats_(WorkerInitStats{WORKER_INIT_STATS(
+            POOL_COUNTER_PREFIX(*scope_,
+                                absl::StrCat("wasm.", runtime, ".plugin.", plugin_name, ".")),
+            POOL_GAUGE_PREFIX(*scope_,
+                              absl::StrCat("wasm.", runtime, ".plugin.", plugin_name, ".")))}) {}
+
+  WorkerInitStats& stats() { return worker_init_stats_; }
+
+private:
+  // Keep the scope alive for the lifetime of the references stored in worker_init_stats_.
+  Stats::ScopeSharedPtr scope_;
+  WorkerInitStats worker_init_stats_;
+};
+
+using WorkerInitStatsHandlerSharedPtr = std::shared_ptr<WorkerInitStatsHandler>;
 #endif
 
 } // namespace Wasm

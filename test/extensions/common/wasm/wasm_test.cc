@@ -1,3 +1,10 @@
+#if defined(HIGRESS)
+#include <thread>
+
+#include "source/common/common/cleanup.h"
+
+#endif
+
 #include "envoy/server/lifecycle_notifier.h"
 
 #include "source/common/common/hex.h"
@@ -25,6 +32,7 @@
 using Envoy::Server::ServerLifecycleNotifier;
 using StageCallbackWithCompletion =
     Envoy::Server::ServerLifecycleNotifier::StageCallbackWithCompletion;
+using testing::_;
 using testing::Eq;
 using testing::Return;
 
@@ -92,6 +100,499 @@ INSTANTIATE_TEST_SUITE_P(Runtimes, WasmCommonTest,
                          Envoy::Extensions::Common::Wasm::runtime_and_cpp_values,
                          Envoy::Extensions::Common::Wasm::wasmTestParamsToString);
 
+#if defined(HIGRESS)
+TEST(WasmWorkerInitStatsTest, TracksInitialFailureSkipAndWrapperLifetime) {
+  Stats::IsolatedStoreImpl stats_store;
+  auto scope = Stats::ScopeSharedPtr(stats_store.createScope(""));
+  NiceMock<LocalInfo::MockLocalInfo> local_info;
+
+  envoy::extensions::wasm::v3::PluginConfig fail_open_config;
+  fail_open_config.set_name("worker_init_test");
+  fail_open_config.set_fail_open(true);
+  auto fail_open_plugin = std::make_shared<Plugin>(
+      fail_open_config, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info,
+      nullptr);
+
+  auto stats = std::make_shared<WorkerInitStatsHandler>(scope, "envoy.wasm.runtime.v8",
+                                                        fail_open_plugin->name_);
+  const std::string prefix = "wasm.envoy.wasm.runtime.v8.plugin.worker_init_test.";
+  auto& retryable_failure =
+      scope->counterFromString(prefix + "worker_init_retryable_failure_total");
+  auto& terminal_failure = scope->counterFromString(prefix + "worker_init_terminal_failure_total");
+  auto& retry_total = scope->counterFromString(prefix + "worker_init_retry_total");
+  auto& recovered_total = scope->counterFromString(prefix + "worker_init_recovered_total");
+  auto& fail_open_skip = scope->counterFromString(prefix + "worker_fail_open_skip_total");
+  auto& uninitialized = scope->gaugeFromString(prefix + "worker_uninitialized",
+                                               Stats::Gauge::ImportMode::NeverImport);
+  NiceMock<Event::MockDispatcher> dispatcher;
+
+  {
+    PluginHandleSharedPtrThreadLocal retryable(
+        ThreadLocalPluginResult{nullptr, proxy_wasm::FailState::UnableToCloneVm}, fail_open_plugin,
+        nullptr, dispatcher, stats);
+    EXPECT_EQ(PluginInitializationState::Uninitialized, retryable.initializationState());
+    EXPECT_EQ(proxy_wasm::FailState::UnableToCloneVm, retryable.lastInitializationFailure());
+    EXPECT_TRUE(retryable.initializationFailureRetryable());
+    ASSERT_NE(nullptr, retryable.handle());
+    EXPECT_EQ(nullptr, retryable.handle()->wasmHandle());
+    EXPECT_EQ(1, retryable_failure.value());
+    EXPECT_EQ(0, terminal_failure.value());
+    EXPECT_EQ(1, uninitialized.value());
+
+    retryable.recordFailOpenSkip();
+    EXPECT_EQ(1, fail_open_skip.value());
+
+    envoy::extensions::wasm::v3::PluginConfig fail_closed_config = fail_open_config;
+    fail_closed_config.set_fail_open(false);
+    auto fail_closed_plugin = std::make_shared<Plugin>(
+        fail_closed_config, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info,
+        nullptr);
+    {
+      PluginHandleSharedPtrThreadLocal terminal(
+          ThreadLocalPluginResult{nullptr, proxy_wasm::FailState::ConfigureFailed},
+          fail_closed_plugin, nullptr, dispatcher, stats);
+      EXPECT_FALSE(terminal.initializationFailureRetryable());
+      terminal.recordFailOpenSkip();
+      EXPECT_EQ(1, terminal_failure.value());
+      EXPECT_EQ(1, fail_open_skip.value());
+      EXPECT_EQ(2, uninitialized.value());
+    }
+    EXPECT_EQ(1, uninitialized.value());
+  }
+
+  EXPECT_EQ(0, uninitialized.value());
+  EXPECT_EQ(0, retry_total.value());
+  EXPECT_EQ(0, recovered_total.value());
+
+  envoy::extensions::wasm::v3::PluginConfig base_failure_config = fail_open_config;
+  base_failure_config.set_fail_open(false);
+  auto base_failure_plugin = std::make_shared<Plugin>(
+      base_failure_config, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info,
+      nullptr);
+  auto base_failure =
+      getOrCreateThreadLocalPluginWithResult(nullptr, base_failure_plugin, dispatcher);
+  ASSERT_NE(nullptr, base_failure.handle);
+  EXPECT_EQ(proxy_wasm::FailState::Ok, base_failure.fail_state);
+  PluginHandleSharedPtrThreadLocal ready(std::move(base_failure), base_failure_plugin, nullptr,
+                                         dispatcher, stats);
+  EXPECT_EQ(PluginInitializationState::Ready, ready.initializationState());
+  EXPECT_EQ(0, uninitialized.value());
+}
+
+class WasmWorkerInitializationRetryTest : public testing::Test {
+protected:
+  void SetUp() override {
+    clearCodeCacheForTesting();
+    envoy::extensions::wasm::v3::PluginConfig config;
+    config.set_name("worker_init_retry_test");
+    config.set_fail_open(true);
+    plugin_ = std::make_shared<Plugin>(
+        config, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info_, nullptr);
+    stats_ =
+        std::make_shared<WorkerInitStatsHandler>(scope_, "envoy.wasm.runtime.v8", plugin_->name_);
+  }
+
+  void advanceRecoveryTime(std::chrono::milliseconds duration) {
+    recovery_time_offset_ += duration;
+    setTimeOffsetForCodeCacheForTesting(recovery_time_offset_);
+  }
+
+  std::unique_ptr<PluginHandleSharedPtrThreadLocal>
+  makeRetryableWrapper(absl::string_view vm_key, ThreadLocalPluginResultFactory factory) {
+    auto wrapper = std::make_unique<PluginHandleSharedPtrThreadLocal>(
+        ThreadLocalPluginResult{nullptr, proxy_wasm::FailState::RuntimeError}, plugin_, nullptr,
+        dispatcher_, stats_, false, std::move(factory));
+    wrapper->setRecoveryVmKeyForTesting(std::string(vm_key));
+    return wrapper;
+  }
+
+  Stats::Counter& counter(absl::string_view name) {
+    return scope_->counterFromString(
+        absl::StrCat("wasm.envoy.wasm.runtime.v8.plugin.worker_init_retry_test.", name));
+  }
+
+  Stats::Gauge& uninitializedGauge() {
+    return scope_->gaugeFromString(
+        "wasm.envoy.wasm.runtime.v8.plugin.worker_init_retry_test.worker_uninitialized",
+        Stats::Gauge::ImportMode::NeverImport);
+  }
+
+  Stats::IsolatedStoreImpl stats_store_;
+  Stats::ScopeSharedPtr scope_{stats_store_.createScope("")};
+  NiceMock<LocalInfo::MockLocalInfo> local_info_;
+  PluginSharedPtr plugin_;
+  WorkerInitStatsHandlerSharedPtr stats_;
+  NiceMock<Event::MockDispatcher> dispatcher_;
+  MonotonicTime::duration recovery_time_offset_{};
+};
+
+TEST_F(WasmWorkerInitializationRetryTest, PersistentFailureUsesRequestOnlyFixedGuardWithoutCap) {
+  uint64_t factory_calls = 0;
+  auto wrapper = makeRetryableWrapper("persistent-key", [&factory_calls]() {
+    ++factory_calls;
+    return ThreadLocalPluginResult{nullptr, proxy_wasm::FailState::RuntimeError};
+  });
+
+  const auto first = wrapper->tryInitialize();
+  EXPECT_EQ(PluginInitializationRecoveryStatus::RetryableFailure, first.status);
+  EXPECT_EQ(1, factory_calls);
+  const auto cooling_down = wrapper->tryInitialize();
+  EXPECT_EQ(PluginInitializationRecoveryStatus::CoolingDown, cooling_down.status);
+  EXPECT_GT(cooling_down.remaining_cooldown.count(), 0);
+  EXPECT_LE(cooling_down.remaining_cooldown, std::chrono::seconds(1));
+  EXPECT_EQ(1, factory_calls);
+
+  for (uint64_t attempt = 2; attempt <= 7; ++attempt) {
+    advanceRecoveryTime(std::chrono::seconds(1));
+    EXPECT_EQ(PluginInitializationRecoveryStatus::RetryableFailure,
+              wrapper->tryInitialize().status);
+    EXPECT_EQ(attempt, factory_calls);
+  }
+
+  EXPECT_EQ(7, wrapper->initializationRetryAttemptsForTesting());
+  EXPECT_EQ(PluginInitializationState::Uninitialized, wrapper->initializationState());
+  EXPECT_TRUE(wrapper->initializationFailureRetryable());
+  EXPECT_EQ(8, counter("worker_init_retryable_failure_total").value());
+  EXPECT_EQ(7, counter("worker_init_retry_total").value());
+  EXPECT_EQ(0, counter("worker_init_recovered_total").value());
+  EXPECT_EQ(1, uninitializedGauge().value());
+
+  advanceRecoveryTime(std::chrono::seconds(32));
+  EXPECT_EQ(7, factory_calls);
+}
+
+TEST_F(WasmWorkerInitializationRetryTest, IdleDoesNotAttemptAndFirstRequestRecoversImmediately) {
+  uint64_t factory_calls = 0;
+  auto wrapper = makeRetryableWrapper("idle-key", [this, &factory_calls]() {
+    ++factory_calls;
+    return ThreadLocalPluginResult{std::make_shared<PluginHandle>(nullptr, plugin_),
+                                   proxy_wasm::FailState::Ok};
+  });
+
+  advanceRecoveryTime(std::chrono::seconds(10));
+  EXPECT_EQ(0, factory_calls);
+  EXPECT_EQ(0, counter("worker_init_retry_total").value());
+  EXPECT_EQ(PluginInitializationState::Uninitialized, wrapper->initializationState());
+  EXPECT_EQ(1, uninitializedGauge().value());
+
+  EXPECT_EQ(PluginInitializationRecoveryStatus::Recovered, wrapper->tryInitialize().status);
+  EXPECT_EQ(1, factory_calls);
+  EXPECT_EQ(PluginInitializationState::Ready, wrapper->initializationState());
+  EXPECT_EQ(proxy_wasm::FailState::Ok, wrapper->lastInitializationFailure());
+  EXPECT_FALSE(wrapper->initializationFailureRetryable());
+  EXPECT_EQ(0, uninitializedGauge().value());
+  EXPECT_EQ(1, counter("worker_init_retry_total").value());
+  EXPECT_EQ(1, counter("worker_init_recovered_total").value());
+}
+
+TEST_F(WasmWorkerInitializationRetryTest, MainThreadFailureIsNeutralAndNeverRecovers) {
+  uint64_t factory_calls = 0;
+  auto wrapper = std::make_unique<PluginHandleSharedPtrThreadLocal>(
+      ThreadLocalPluginResult{nullptr, proxy_wasm::FailState::RuntimeError}, plugin_, nullptr,
+      dispatcher_, stats_, false,
+      [&factory_calls]() {
+        ++factory_calls;
+        return ThreadLocalPluginResult{nullptr, proxy_wasm::FailState::RuntimeError};
+      },
+      PluginInitializationRole::MainThread);
+
+  EXPECT_FALSE(wrapper->participatesInWorkerInitialization());
+  EXPECT_EQ(PluginInitializationState::Ready, wrapper->initializationState());
+  EXPECT_FALSE(wrapper->initializationFailureRetryable());
+  ASSERT_NE(nullptr, wrapper->handle());
+  EXPECT_EQ(nullptr, wrapper->handle()->wasmHandle());
+  EXPECT_EQ(0, counter("worker_init_retryable_failure_total").value());
+  EXPECT_EQ(0, counter("worker_init_terminal_failure_total").value());
+  EXPECT_EQ(0, counter("worker_init_retry_total").value());
+  EXPECT_EQ(0, counter("worker_init_recovered_total").value());
+  EXPECT_EQ(0, uninitializedGauge().value());
+  EXPECT_EQ(0, rebuildGuardRegistrySizeForTesting());
+
+  advanceRecoveryTime(std::chrono::seconds(10));
+  EXPECT_EQ(PluginInitializationRecoveryStatus::TerminalFailure, wrapper->tryInitialize().status);
+  EXPECT_EQ(0, factory_calls);
+  EXPECT_EQ(0, rebuildGuardRegistrySizeForTesting());
+  wrapper->recordFailOpenSkip();
+  EXPECT_EQ(0, counter("worker_fail_open_skip_total").value());
+}
+
+TEST_F(WasmWorkerInitializationRetryTest, MainThreadSuccessPreservesReadyHandleOwnership) {
+  auto handle = std::make_shared<PluginHandle>(nullptr, plugin_);
+  PluginHandleSharedPtrThreadLocal wrapper(
+      ThreadLocalPluginResult{handle, proxy_wasm::FailState::Ok}, plugin_, nullptr, dispatcher_,
+      stats_, false, nullptr, PluginInitializationRole::MainThread);
+
+  EXPECT_FALSE(wrapper.participatesInWorkerInitialization());
+  EXPECT_EQ(PluginInitializationState::Ready, wrapper.initializationState());
+  EXPECT_EQ(handle, wrapper.handle());
+  EXPECT_EQ(0, uninitializedGauge().value());
+  EXPECT_EQ(0, counter("worker_init_retryable_failure_total").value());
+  EXPECT_EQ(0, counter("worker_init_terminal_failure_total").value());
+}
+
+TEST_F(WasmWorkerInitializationRetryTest, FourRequestWorkersCountAndRecoverIndependently) {
+  constexpr uint64_t worker_count = 4;
+  std::vector<uint64_t> factory_calls(worker_count, 0);
+  std::vector<std::unique_ptr<PluginHandleSharedPtrThreadLocal>> wrappers;
+  wrappers.reserve(worker_count);
+  for (uint64_t worker = 0; worker < worker_count; ++worker) {
+    wrappers.push_back(makeRetryableWrapper(
+        absl::StrCat("request-worker-", worker), [this, &factory_calls, worker]() {
+          ++factory_calls[worker];
+          return ThreadLocalPluginResult{std::make_shared<PluginHandle>(nullptr, plugin_),
+                                         proxy_wasm::FailState::Ok};
+        }));
+  }
+
+  EXPECT_EQ(worker_count, counter("worker_init_retryable_failure_total").value());
+  EXPECT_EQ(worker_count, uninitializedGauge().value());
+  for (uint64_t worker = 0; worker < worker_count; ++worker) {
+    EXPECT_TRUE(wrappers[worker]->participatesInWorkerInitialization());
+    EXPECT_EQ(PluginInitializationRecoveryStatus::Recovered,
+              wrappers[worker]->tryInitialize().status);
+    EXPECT_EQ(1, factory_calls[worker]);
+  }
+  EXPECT_EQ(worker_count, counter("worker_init_retry_total").value());
+  EXPECT_EQ(worker_count, counter("worker_init_recovered_total").value());
+  EXPECT_EQ(0, uninitializedGauge().value());
+}
+
+TEST_F(WasmWorkerInitializationRetryTest, LatestRetryReasonCanBecomeTerminal) {
+  uint64_t factory_calls = 0;
+  auto wrapper = makeRetryableWrapper("terminal-key", [&factory_calls]() {
+    ++factory_calls;
+    return ThreadLocalPluginResult{nullptr, proxy_wasm::FailState::ConfigureFailed};
+  });
+
+  EXPECT_EQ(PluginInitializationRecoveryStatus::TerminalFailure, wrapper->tryInitialize().status);
+  EXPECT_EQ(PluginInitializationState::Uninitialized, wrapper->initializationState());
+  EXPECT_EQ(proxy_wasm::FailState::ConfigureFailed, wrapper->lastInitializationFailure());
+  EXPECT_FALSE(wrapper->initializationFailureRetryable());
+  EXPECT_EQ(1, counter("worker_init_retryable_failure_total").value());
+  EXPECT_EQ(1, counter("worker_init_terminal_failure_total").value());
+  EXPECT_EQ(1, counter("worker_init_retry_total").value());
+  EXPECT_EQ(1, factory_calls);
+
+  advanceRecoveryTime(std::chrono::seconds(10));
+  EXPECT_EQ(PluginInitializationRecoveryStatus::TerminalFailure, wrapper->tryInitialize().status);
+  EXPECT_EQ(1, factory_calls);
+  EXPECT_EQ(1, counter("worker_init_terminal_failure_total").value());
+}
+
+TEST_F(WasmWorkerInitializationRetryTest, RetryAllowlistIsTerminalByDefault) {
+  NiceMock<Event::MockDispatcher> dispatcher;
+  EXPECT_CALL(dispatcher, createTimer_(_)).Times(0);
+  for (const auto state :
+       {proxy_wasm::FailState::UnableToCreateVm, proxy_wasm::FailState::UnableToCloneVm,
+        proxy_wasm::FailState::UnableToInitializeCode, proxy_wasm::FailState::RuntimeError}) {
+    PluginHandleSharedPtrThreadLocal wrapper(ThreadLocalPluginResult{nullptr, state}, plugin_,
+                                             nullptr, dispatcher, nullptr);
+    EXPECT_TRUE(wrapper.initializationFailureRetryable());
+    EXPECT_EQ(0, wrapper.initializationRetryAttemptsForTesting());
+  }
+
+  for (const auto state :
+       {proxy_wasm::FailState::StartFailed, proxy_wasm::FailState::ConfigureFailed,
+        proxy_wasm::FailState::MissingFunction, proxy_wasm::FailState::RecoverError,
+        static_cast<proxy_wasm::FailState>(999)}) {
+    PluginHandleSharedPtrThreadLocal wrapper(ThreadLocalPluginResult{nullptr, state}, plugin_,
+                                             nullptr, dispatcher, nullptr);
+    EXPECT_FALSE(wrapper.initializationFailureRetryable());
+    EXPECT_EQ(0, wrapper.initializationRetryAttemptsForTesting());
+  }
+}
+
+TEST_F(WasmWorkerInitializationRetryTest, ReplacementOwnsStateButSharesVmKeyGuard) {
+  uint64_t old_factory_calls = 0;
+  auto old_wrapper = makeRetryableWrapper("shared-key", [&old_factory_calls]() {
+    ++old_factory_calls;
+    return ThreadLocalPluginResult{nullptr, proxy_wasm::FailState::RuntimeError};
+  });
+  EXPECT_EQ(1, uninitializedGauge().value());
+  EXPECT_EQ(PluginInitializationRecoveryStatus::RetryableFailure,
+            old_wrapper->tryInitialize().status);
+  EXPECT_EQ(1, old_factory_calls);
+  old_wrapper.reset();
+  EXPECT_EQ(0, uninitializedGauge().value());
+
+  uint64_t new_factory_calls = 0;
+  auto new_wrapper = makeRetryableWrapper("shared-key", [&new_factory_calls]() {
+    ++new_factory_calls;
+    return ThreadLocalPluginResult{nullptr, proxy_wasm::FailState::RuntimeError};
+  });
+  EXPECT_EQ(0, new_wrapper->initializationRetryAttemptsForTesting());
+  EXPECT_EQ(1, uninitializedGauge().value());
+  EXPECT_EQ(PluginInitializationRecoveryStatus::CoolingDown, new_wrapper->tryInitialize().status);
+  EXPECT_EQ(0, new_factory_calls);
+
+  uint64_t different_factory_calls = 0;
+  auto different_wrapper = makeRetryableWrapper("different-key", [&different_factory_calls]() {
+    ++different_factory_calls;
+    return ThreadLocalPluginResult{nullptr, proxy_wasm::FailState::RuntimeError};
+  });
+  EXPECT_EQ(PluginInitializationRecoveryStatus::RetryableFailure,
+            different_wrapper->tryInitialize().status);
+  EXPECT_EQ(1, different_factory_calls);
+
+  advanceRecoveryTime(std::chrono::seconds(1));
+  EXPECT_EQ(PluginInitializationRecoveryStatus::RetryableFailure,
+            new_wrapper->tryInitialize().status);
+  EXPECT_EQ(1, new_factory_calls);
+  EXPECT_EQ(1, new_wrapper->initializationRetryAttemptsForTesting());
+}
+
+TEST_F(WasmWorkerInitializationRetryTest, GuardFirstAttemptAtEpochAndCrossKeySweep) {
+  EXPECT_TRUE(acquireRecoveryPermitForTesting("key-a", dispatcher_));
+  EXPECT_FALSE(acquireRecoveryPermitForTesting("key-a", dispatcher_));
+  EXPECT_TRUE(acquireRecoveryPermitForTesting("key-b", dispatcher_));
+  EXPECT_EQ(2, rebuildGuardRegistrySizeForTesting());
+
+  advanceRecoveryTime(std::chrono::seconds(1));
+  EXPECT_TRUE(acquireRecoveryPermitForTesting("key-c", dispatcher_));
+  EXPECT_EQ(1, rebuildGuardRegistrySizeForTesting());
+}
+
+TEST_P(WasmCommonTest, BaseWasmHandleDeletionUsesOwningDispatcher) {
+  Stats::IsolatedStoreImpl stats_store;
+  Api::ApiPtr api = Api::createApiForTest(stats_store);
+  NiceMock<Upstream::MockClusterManager> cluster_manager;
+  NiceMock<Init::MockManager> init_manager;
+  NiceMock<Server::MockServerLifecycleNotifier> lifecycle_notifier;
+  NiceMock<Event::MockDispatcher> dispatcher("main_thread");
+  NiceMock<Runtime::MockLoader> runtime;
+  Config::DataSource::RemoteAsyncDataProviderPtr remote_data_provider;
+  auto scope = Stats::ScopeSharedPtr(stats_store.createScope("wasm."));
+  NiceMock<LocalInfo::MockLocalInfo> local_info;
+
+  envoy::extensions::wasm::v3::PluginConfig plugin_config;
+  plugin_config.set_name("base_wasm_owner_dispatcher");
+  auto* vm_config = plugin_config.mutable_vm_config();
+  vm_config->set_vm_id("base_wasm_owner_dispatcher");
+  vm_config->set_runtime(absl::StrCat("envoy.wasm.runtime.", std::get<0>(GetParam())));
+  const std::string code =
+      std::get<0>(GetParam()) == "null"
+          ? "CommonWasmTestCpp"
+          : TestEnvironment::readFileToStringForTest(
+                TestEnvironment::substitute("{{ test_rundir }}/test/extensions/common/wasm/"
+                                            "test_data/test_cpp.wasm"));
+  ASSERT_FALSE(code.empty());
+  vm_config->mutable_code()->mutable_local()->set_inline_bytes(code);
+  auto plugin = std::make_shared<Plugin>(
+      plugin_config, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info, nullptr);
+
+  WasmHandleSharedPtr base_wasm;
+  ASSERT_TRUE(createWasm(
+      plugin, scope, cluster_manager, init_manager, dispatcher, *api, lifecycle_notifier,
+      remote_data_provider, [&base_wasm](const WasmHandleSharedPtr& handle) { base_wasm = handle; },
+      nullptr, &runtime));
+  ASSERT_NE(base_wasm, nullptr);
+  std::weak_ptr<proxy_wasm::WasmBase> weak_wasm = base_wasm->wasm();
+
+  Event::DispatcherThreadDeletableConstPtr pending_deletion;
+  EXPECT_CALL(dispatcher, deleteInDispatcherThread(_))
+      .WillOnce(Invoke([&pending_deletion](Event::DispatcherThreadDeletableConstPtr deletable) {
+        pending_deletion = std::move(deletable);
+      }));
+
+  std::thread worker([base_wasm = std::move(base_wasm)]() mutable { base_wasm.reset(); });
+  worker.join();
+
+  EXPECT_FALSE(weak_wasm.expired());
+  ASSERT_NE(pending_deletion, nullptr);
+  pending_deletion.reset();
+  EXPECT_TRUE(weak_wasm.expired());
+}
+
+TEST_P(WasmCommonTest, WorkerCloneFailureDoesNotPoisonBaseOrNackNextSameVmKeyConfig) {
+  proxy_wasm::clearWasmCachesForTesting();
+  clearCodeCacheForTesting();
+  Cleanup cleanup([]() {
+    proxy_wasm::clearWasmCachesForTesting();
+    clearCodeCacheForTesting();
+  });
+
+  Stats::IsolatedStoreImpl stats_store;
+  Api::ApiPtr api = Api::createApiForTest(stats_store);
+  NiceMock<Upstream::MockClusterManager> cluster_manager;
+  NiceMock<Init::MockManager> init_manager;
+  NiceMock<Server::MockServerLifecycleNotifier> lifecycle_notifier;
+  Event::DispatcherPtr dispatcher(api->allocateDispatcher("wasm_worker_clone_failure_test"));
+  NiceMock<Runtime::MockLoader> runtime;
+  Config::DataSource::RemoteAsyncDataProviderPtr remote_data_provider;
+  auto scope = Stats::ScopeSharedPtr(stats_store.createScope("wasm."));
+  NiceMock<LocalInfo::MockLocalInfo> local_info;
+
+  envoy::extensions::wasm::v3::PluginConfig plugin_config;
+  plugin_config.set_name("worker_clone_failure_isolation");
+  auto* vm_config = plugin_config.mutable_vm_config();
+  vm_config->set_vm_id("worker_clone_failure_isolation");
+  vm_config->set_runtime(absl::StrCat("envoy.wasm.runtime.", std::get<0>(GetParam())));
+  const std::string code =
+      std::get<0>(GetParam()) == "null"
+          ? "CommonWasmTestCpp"
+          : TestEnvironment::readFileToStringForTest(
+                TestEnvironment::substitute("{{ test_rundir }}/test/extensions/common/wasm/"
+                                            "test_data/test_cpp.wasm"));
+  ASSERT_FALSE(code.empty());
+  vm_config->mutable_code()->mutable_local()->set_inline_bytes(code);
+  auto plugin = std::make_shared<Plugin>(
+      plugin_config, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info, nullptr);
+
+  WasmHandleSharedPtr healthy_base;
+  EXPECT_TRUE(createWasm(
+      plugin, scope, cluster_manager, init_manager, *dispatcher, *api, lifecycle_notifier,
+      remote_data_provider,
+      [&healthy_base](const WasmHandleSharedPtr& handle) { healthy_base = handle; }, nullptr,
+      &runtime));
+  ASSERT_NE(nullptr, healthy_base);
+  ASSERT_NE(nullptr, healthy_base->wasm());
+  const std::string vm_key(healthy_base->wasm()->vm_key());
+
+  uint32_t clone_invocations = 0;
+  const auto clone_factory =
+      [&clone_invocations](const WasmHandleBaseSharedPtr&) -> WasmHandleBaseSharedPtr {
+    ++clone_invocations;
+    return nullptr;
+  };
+  const auto plugin_factory =
+      [](const WasmHandleBaseSharedPtr& wasm_handle,
+         const PluginBaseSharedPtr& plugin_handle) -> PluginHandleBaseSharedPtr {
+    return std::make_shared<PluginHandle>(std::static_pointer_cast<WasmHandle>(wasm_handle),
+                                          std::static_pointer_cast<Plugin>(plugin_handle));
+  };
+  const auto worker_failure = proxy_wasm::getOrCreateThreadLocalPluginWithResult(
+      std::static_pointer_cast<proxy_wasm::WasmHandleBase>(healthy_base), plugin, clone_factory,
+      plugin_factory);
+  EXPECT_EQ(nullptr, worker_failure.handle);
+  EXPECT_EQ(proxy_wasm::FailState::UnableToCloneVm, worker_failure.fail_state);
+  EXPECT_EQ(1U, clone_invocations);
+  EXPECT_EQ(proxy_wasm::FailState::Ok, healthy_base->wasm()->fail_state());
+  EXPECT_FALSE(healthy_base->wasm()->isFailed());
+  EXPECT_EQ(nullptr, proxy_wasm::getThreadLocalWasm(vm_key));
+
+  WasmHandleSharedPtr same_key_base;
+  EXPECT_TRUE(createWasm(
+      plugin, scope, cluster_manager, init_manager, *dispatcher, *api, lifecycle_notifier,
+      remote_data_provider,
+      [&same_key_base](const WasmHandleSharedPtr& handle) { same_key_base = handle; }, nullptr,
+      &runtime));
+  EXPECT_NE(nullptr, same_key_base);
+  EXPECT_EQ(healthy_base, same_key_base);
+
+  // A second real Host worker entry must invoke clone again. If the failed worker had
+  // polluted the thread-local cache, this factory would not be called a second time.
+  const auto repeated_worker_failure = proxy_wasm::getOrCreateThreadLocalPluginWithResult(
+      std::static_pointer_cast<proxy_wasm::WasmHandleBase>(same_key_base), plugin, clone_factory,
+      plugin_factory);
+  EXPECT_EQ(nullptr, repeated_worker_failure.handle);
+  EXPECT_EQ(proxy_wasm::FailState::UnableToCloneVm, repeated_worker_failure.fail_state);
+  EXPECT_EQ(2U, clone_invocations);
+  EXPECT_EQ(proxy_wasm::FailState::Ok, healthy_base->wasm()->fail_state());
+  EXPECT_FALSE(healthy_base->wasm()->isFailed());
+  EXPECT_EQ(nullptr, proxy_wasm::getThreadLocalWasm(vm_key));
+}
+#endif
+
 TEST_P(WasmCommonTest, WasmFailState) {
   Stats::IsolatedStoreImpl stats_store;
   Api::ApiPtr api = Api::createApiForTest(stats_store);
@@ -105,8 +606,8 @@ TEST_P(WasmCommonTest, WasmFailState) {
       plugin_config, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info, nullptr);
 #ifdef HIGRESS
   // auto wasm = std::make_shared<WasmHandle>(
-  //     std::make_unique<Wasm>(plugin->wasmConfig(), "", scope, *api, cluster_manager, *dispatcher),
-  //     *dispatcher);
+  //     std::make_unique<Wasm>(plugin->wasmConfig(), "", scope, *api, cluster_manager,
+  //     *dispatcher), *dispatcher);
   auto wasm = std::make_shared<WasmHandle>(
       std::make_unique<Wasm>(plugin->wasmConfig(), "", scope, *api, cluster_manager, *dispatcher));
 #else
@@ -841,7 +1342,7 @@ TEST_P(WasmCommonTest, RemoteCode) {
             });
 #ifdef HIGRESS
         return std::make_shared<WasmHandle>(wasm);
-        // return std::make_shared<WasmHandle>(wasm, *dispatcher);
+    // return std::make_shared<WasmHandle>(wasm, *dispatcher);
 #else
         return std::make_shared<WasmHandle>(wasm);
 #endif
@@ -967,7 +1468,7 @@ TEST_P(WasmCommonTest, RemoteCodeMultipleRetry) {
             });
 #ifdef HIGRESS
         return std::make_shared<WasmHandle>(wasm);
-        // return std::make_shared<WasmHandle>(wasm, *dispatcher);
+    // return std::make_shared<WasmHandle>(wasm, *dispatcher);
 #else
         return std::make_shared<WasmHandle>(wasm);
 #endif
