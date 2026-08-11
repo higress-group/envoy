@@ -1,0 +1,21 @@
+resources:
+- "@type": type.googleapis.com/envoy.config.core.v3.TypedExtensionConfig
+  name: worker_init_repro_filter
+  typed_config:
+    "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+    type_url: type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+    value:
+      config:
+        name: worker_init_repro
+        root_id: worker_init_repro
+        fail_open: __FAIL_OPEN__
+        vm_config:
+          vm_id: worker_init_repro
+          runtime: envoy.wasm.runtime.v8
+          code:
+            local:
+              filename: "__WASM_BINARY__"
+          allow_precompiled: true
+        configuration:
+          "@type": type.googleapis.com/google.protobuf.StringValue
+          value: '{"mode":"__MODE__","run_id":"__RUN_ID__","worker_count":__WORKER_COUNT__,"generation":"__GENERATION__"}'

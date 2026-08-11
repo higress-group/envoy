@@ -1,0 +1,60 @@
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: __ADMIN_PORT__
+
+static_resources:
+  listeners:
+  - name: worker_init_repro
+    address:
+      socket_address:
+        address: 127.0.0.1
+        port_value: __LISTENER_PORT__
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: worker_init_repro
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: local_service
+              domains: ["*"]
+              routes:
+              - match: {prefix: "/"}
+                route: {cluster: repro_upstream}
+          http_filters:
+          - name: envoy.filters.http.wasm
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+              config:
+                name: worker_init_repro
+                root_id: worker_init_repro
+                fail_open: __FAIL_OPEN__
+                vm_config:
+                  vm_id: worker_init_repro
+                  runtime: envoy.wasm.runtime.v8
+                  code:
+                    local:
+                      filename: "__WASM_BINARY__"
+                configuration:
+                  "@type": type.googleapis.com/google.protobuf.StringValue
+                  value: '{"mode":"__MODE__","run_id":"__RUN_ID__","worker_count":__WORKER_COUNT__,"generation":"__GENERATION__"}'
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+  - name: repro_upstream
+    connect_timeout: 1s
+    type: STATIC
+    load_assignment:
+      cluster_name: repro_upstream
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: __UPSTREAM_PORT__

@@ -2206,7 +2206,7 @@ TEST_P(WasmHttpFilterTest, ProactiveRebuildPrunesExpiredOldGenerations) {
   EXPECT_EQ(2U, rebuild_total.value());
 }
 
-TEST_P(WasmHttpFilterTest, ProactiveRebuildSkipsWhenCurrentGenerationActiveWithoutOld) {
+TEST_P(WasmHttpFilterTest, ProactiveRebuildRollsActiveCurrentAndBoundsLiveOldGeneration) {
   auto runtime = std::get<0>(GetParam());
   if (runtime == "null") {
     return;
@@ -2220,18 +2220,35 @@ TEST_P(WasmHttpFilterTest, ProactiveRebuildSkipsWhenCurrentGenerationActiveWitho
                                                   ".plugin.plugin_name.rebuild_total");
 
   PluginHandleSharedPtrThreadLocal thread_local_handle(plugin_handle_);
+  auto old_stream_context = makeStreamContext(plugin_handle_);
+  Wasm* old_wasm = old_stream_context->wasm();
+  ASSERT_NE(nullptr, old_wasm);
+  EXPECT_EQ(1U, old_wasm->activeStreamCount());
+
   advanceRebuildInterval();
   ASSERT_TRUE(rebuildThroughThreadLocal(thread_local_handle));
   EXPECT_EQ(1U, rebuild_total.value());
+  ASSERT_NE(nullptr, thread_local_handle.handle());
+  ASSERT_NE(nullptr, thread_local_handle.handle()->wasmHandle());
+  ASSERT_NE(nullptr, thread_local_handle.handle()->wasmHandle()->wasm());
+  EXPECT_EQ(old_wasm, old_stream_context->wasm());
+  EXPECT_NE(old_wasm, thread_local_handle.handle()->wasmHandle()->wasm().get());
+  EXPECT_EQ(1U, old_wasm->activeStreamCount());
+  EXPECT_EQ(0U, thread_local_handle.handle()->wasmHandle()->wasm()->activeStreamCount());
 
-  auto current_stream_context = makeStreamContext(plugin_handle_);
-  EXPECT_EQ(1U, wasm_->wasm()->activeStreamCount());
-
+  // The active A generation is now the single live old generation, so another
+  // proactive cutover from B to C is rejected without changing success metrics.
   advanceRebuildInterval();
   EXPECT_FALSE(rebuildThroughThreadLocal(thread_local_handle));
   EXPECT_EQ(1U, rebuild_total.value());
 
-  current_stream_context->onDestroy();
+  old_stream_context->onDestroy();
+  old_stream_context.reset();
+
+  // Once the Context releases A and the cooldown has elapsed, B can roll to C.
+  advanceRebuildInterval();
+  EXPECT_TRUE(rebuildThroughThreadLocal(thread_local_handle));
+  EXPECT_EQ(2U, rebuild_total.value());
 }
 
 TEST_P(WasmHttpFilterTest, RebuildGuardRegistryRetiresStaleVmKeys) {
@@ -2324,7 +2341,7 @@ TEST_P(WasmHttpFilterTest, ActiveCounterIncludesDifferentPluginHandleOnSameGener
   EXPECT_EQ(0U, wasm_->wasm()->activeStreamCount());
 }
 
-TEST_P(WasmHttpFilterTest, FailRecoveryBypassesProactiveActiveGuard) {
+TEST_P(WasmHttpFilterTest, FailRecoveryBypassesProactiveRollingGuard) {
   auto runtime = std::get<0>(GetParam());
   if (runtime == "null") {
     return;
@@ -2443,7 +2460,7 @@ TEST_P(WasmHttpFilterTest, ReclaimMemoryThresholdFallsBackWhenRuntimeValueIsZero
   EXPECT_EQ(800ULL * 1024 * 1024, wasm_->wasm()->reclaimMemoryThreshold());
 }
 
-TEST_P(WasmHttpFilterTest, ReclaimTimerSkipKeepsEligibleSinceUntilSuccessfulReclaim) {
+TEST_P(WasmHttpFilterTest, ReclaimTimerLiveOldSkipKeepsEligibleSinceUntilSuccessfulReclaim) {
   auto runtime = std::get<0>(GetParam());
   if (runtime == "null") {
     return;
@@ -2457,23 +2474,35 @@ TEST_P(WasmHttpFilterTest, ReclaimTimerSkipKeepsEligibleSinceUntilSuccessfulRecl
                                                   ".plugin.plugin_name.rebuild_total");
 
   auto thread_local_handle = makeThreadLocalHandle(true);
-  auto stream_context = makeStreamContext(plugin_handle_);
-  auto wasm = thread_local_handle->handle()->wasmHandle()->wasm();
-  wasm->setShouldRebuild(true);
+  auto old_stream_context = makeStreamContext(plugin_handle_);
+  auto old_wasm = thread_local_handle->handle()->wasmHandle()->wasm();
+  old_wasm->setShouldRebuild(true);
+  old_wasm->markReclaimEligible();
 
-  advanceRebuildInterval();
-  thread_local_handle->runReclaimTimerForTesting();
-
-  EXPECT_EQ(0U, rebuild_total.value());
-  EXPECT_TRUE(wasm->reclaimEligibleSinceForTesting().has_value());
-
-  stream_context->onDestroy();
   advanceRebuildInterval();
   thread_local_handle->runReclaimTimerForTesting();
   adoptThreadLocalHandle(*thread_local_handle);
 
   EXPECT_EQ(1U, rebuild_total.value());
-  EXPECT_FALSE(wasm->reclaimEligibleSinceForTesting().has_value());
+  EXPECT_FALSE(old_wasm->reclaimEligibleSinceForTesting().has_value());
+
+  auto current_wasm = thread_local_handle->handle()->wasmHandle()->wasm();
+  current_wasm->setShouldRebuild(true);
+  current_wasm->markReclaimEligible();
+  advanceRebuildInterval();
+  thread_local_handle->runReclaimTimerForTesting();
+
+  EXPECT_EQ(1U, rebuild_total.value());
+  EXPECT_TRUE(current_wasm->reclaimEligibleSinceForTesting().has_value());
+
+  old_stream_context->onDestroy();
+  old_stream_context.reset();
+  advanceRebuildInterval();
+  thread_local_handle->runReclaimTimerForTesting();
+  adoptThreadLocalHandle(*thread_local_handle);
+
+  EXPECT_EQ(2U, rebuild_total.value());
+  EXPECT_FALSE(current_wasm->reclaimEligibleSinceForTesting().has_value());
 }
 
 TEST_P(WasmHttpFilterTest, ReclaimTimerStillHonorsRecoverInterval) {

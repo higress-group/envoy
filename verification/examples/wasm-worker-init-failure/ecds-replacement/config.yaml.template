@@ -1,0 +1,29 @@
+node:
+  cluster: worker-init-ecds
+  id: worker-init-ecds
+
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: __ADMIN_PORT__
+
+dynamic_resources:
+  lds_config:
+    resource_api_version: V3
+    path: __WORKDIR__/lds.yaml
+
+static_resources:
+  clusters:
+  - name: repro_upstream
+    connect_timeout: 1s
+    type: STATIC
+    load_assignment:
+      cluster_name: repro_upstream
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: __UPSTREAM_PORT__

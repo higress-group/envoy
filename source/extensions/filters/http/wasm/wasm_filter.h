@@ -21,6 +21,22 @@ using Envoy::Extensions::Common::Wasm::PluginHandleSharedPtrThreadLocal;
 using Envoy::Extensions::Common::Wasm::PluginSharedPtr;
 using Envoy::Extensions::Common::Wasm::Wasm;
 
+#if defined(HIGRESS)
+class UninitializedFailClosedContext final : public Context {
+public:
+  using Context::Context;
+
+  Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap&, bool) override {
+    failStream(proxy_wasm::WasmStreamType::Request);
+    return Http::FilterHeadersStatus::StopIteration;
+  }
+
+  Http::FilterHeadersStatus encodeHeaders(Http::ResponseHeaderMap&, bool) override {
+    return Http::FilterHeadersStatus::Continue;
+  }
+};
+#endif
+
 class FilterConfig : Logger::Loggable<Logger::Id::wasm> {
 public:
   FilterConfig(const envoy::extensions::filters::http::wasm::v3::Wasm& config,
@@ -35,7 +51,25 @@ public:
     if (!opt_ref) {
       return nullptr;
     }
+#if defined(HIGRESS)
     PluginHandleSharedPtr handle = opt_ref->handle();
+    if (opt_ref->initializationState() ==
+        Envoy::Extensions::Common::Wasm::PluginInitializationState::Uninitialized) {
+      const auto recovery = opt_ref->tryInitialize();
+      if (recovery.status ==
+          Envoy::Extensions::Common::Wasm::PluginInitializationRecoveryStatus::Recovered) {
+        handle = opt_ref->handle();
+      } else if (handle != nullptr && handle->plugin()->fail_open_) {
+        opt_ref->recordFailOpenSkip();
+        return nullptr;
+      } else if (handle != nullptr) {
+        return std::make_shared<UninitializedFailClosedContext>(nullptr, 0, handle);
+      }
+    }
+#endif
+#if !defined(HIGRESS)
+    PluginHandleSharedPtr handle = opt_ref->handle();
+#endif
     if (!handle) {
       return nullptr;
     }

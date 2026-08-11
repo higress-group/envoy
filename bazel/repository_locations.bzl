@@ -1362,8 +1362,9 @@ REPOSITORY_LOCATIONS_SPEC = dict(
         project_name = "WebAssembly for Proxies (C++ host implementation)",
         project_desc = "WebAssembly for Proxies (C++ host implementation)",
         project_url = "https://github.com/higress-group/proxy-wasm-cpp-host",
-        version = "04ef279d83a39d507d882bb35e3199abcecfe5af",
-        sha256 = "2573ecab4f3c12c10a61f2e34a69a3c4d6f20525c9ae07bcaac72b0a9921df78",
+        # Latest master revision containing worker-local Wasm failure isolation.
+        version = "d9c558753df6781388e36e0d51adc98c0b6835a0",
+        sha256 = "75c6572c180ea07779d55671a74864c6c5f8a4a3c15e8c6de88b1fc46ff77797",
         strip_prefix = "proxy-wasm-cpp-host-{version}",
         urls = ["https://github.com/higress-group/proxy-wasm-cpp-host/archive/{version}.tar.gz"],
         use_category = ["dataplane_ext"],
@@ -1379,7 +1380,7 @@ REPOSITORY_LOCATIONS_SPEC = dict(
             "envoy.wasm.runtime.wavm",
             "envoy.wasm.runtime.wasmtime",
         ],
-        release_date = "2024-05-18",
+        release_date = "2026-08-11",
         cpe = "N/A",
     ),
     proxy_wasm_rust_sdk = dict(
