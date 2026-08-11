@@ -54,6 +54,18 @@ private:
   std::unique_ptr<Config::DataFetcher::RemoteDataFetcher> fetcher_;
 };
 
+#ifdef HIGRESS
+// Base Wasm handles are shared by the main thread and every worker clone. Keep final destruction
+// on the owning (main) dispatcher even when the last worker TLS wrapper owns the final reference.
+class BaseWasmHandleDispatcherThreadDeletable : public Event::DispatcherThreadDeletable {
+public:
+  explicit BaseWasmHandleDispatcherThreadDeletable(WasmHandle* handle) : handle_(handle) {}
+
+private:
+  std::unique_ptr<WasmHandle> handle_;
+};
+#endif
+
 const std::string INLINE_STRING = "<inline>";
 const int CODE_CACHE_SECONDS_NEGATIVE_CACHING = 10;
 const int CODE_CACHE_SECONDS_CACHING_TTL = 24 * 3600; // 24 hours.
@@ -92,7 +104,48 @@ WasmEvent failStateToWasmEvent(FailState state) {
   PANIC("corrupt enum");
 }
 
-const int MIN_RECOVER_INTERVAL_SECONDS = 1;
+absl::string_view failStateName(FailState state) {
+  switch (state) {
+  case FailState::Ok:
+    return "Ok";
+  case FailState::UnableToCreateVm:
+    return "UnableToCreateVm";
+  case FailState::UnableToCloneVm:
+    return "UnableToCloneVm";
+  case FailState::MissingFunction:
+    return "MissingFunction";
+  case FailState::UnableToInitializeCode:
+    return "UnableToInitializeCode";
+  case FailState::StartFailed:
+    return "StartFailed";
+  case FailState::ConfigureFailed:
+    return "ConfigureFailed";
+  case FailState::RuntimeError:
+    return "RuntimeError";
+  case FailState::RecoverError:
+    return "RecoverError";
+  }
+  return "Unknown";
+}
+
+bool isRetryableWorkerInitializationFailure(FailState state) {
+  switch (state) {
+  case FailState::UnableToCreateVm:
+  case FailState::UnableToCloneVm:
+  case FailState::UnableToInitializeCode:
+  case FailState::RuntimeError:
+    return true;
+  case FailState::Ok:
+  case FailState::MissingFunction:
+  case FailState::StartFailed:
+  case FailState::ConfigureFailed:
+  case FailState::RecoverError:
+    return false;
+  }
+  return false;
+}
+
+constexpr std::chrono::seconds kRecoveryGuardInterval{1};
 constexpr uint64_t DefaultReclaimMemoryThresholdBytes = 800ULL * 1024 * 1024;
 constexpr absl::string_view ReclaimMemoryThresholdRuntimeKey =
     "envoy.wasm.reclaim.memory_threshold_bytes";
@@ -102,7 +155,7 @@ MonotonicTime effectiveMonotonicTime(Event::Dispatcher& dispatcher) {
 }
 
 struct RebuildGuardEntry {
-  MonotonicTime last_recover_time;
+  absl::optional<MonotonicTime> last_recover_time;
   std::weak_ptr<WasmHandle> current_wasm_handle;
   std::vector<std::weak_ptr<WasmHandle>> old_wasm_handles;
 
@@ -134,27 +187,68 @@ struct RebuildGuardEntry {
     old_wasm_handles.push_back(old_wasm_handle);
   }
 
-  bool canRetire() {
+  bool canRetire(MonotonicTime now) {
     pruneExpired();
-    return current_wasm_handle.expired() && old_wasm_handles.empty();
+    if (!current_wasm_handle.expired() || !old_wasm_handles.empty()) {
+      return false;
+    }
+    // A worker initialization retry can record a recovery attempt without creating a Wasm
+    // generation. Retain that otherwise-empty entry through the cooldown so a new wrapper cannot
+    // bypass request recovery throttling by recreating the entry.
+    return !last_recover_time.has_value() ||
+           now - last_recover_time.value() >= kRecoveryGuardInterval;
   }
 };
 
 thread_local absl::flat_hash_map<std::string, RebuildGuardEntry> rebuild_guard_registry;
 
-void sweepRebuildGuardRegistry(const std::string& active_vm_key) {
+void sweepRebuildGuardRegistry(const std::string& active_vm_key, MonotonicTime now) {
   for (auto it = rebuild_guard_registry.begin(); it != rebuild_guard_registry.end();) {
     if (it->first == active_vm_key) {
       ++it;
       continue;
     }
-    if (it->second.canRetire()) {
+    if (it->second.canRetire(now)) {
       auto erase_it = it++;
       rebuild_guard_registry.erase(erase_it);
     } else {
       ++it;
     }
   }
+}
+
+RebuildGuardEntry& rebuildGuardEntry(const std::string& vm_key, MonotonicTime now) {
+  sweepRebuildGuardRegistry(vm_key, now);
+  return rebuild_guard_registry[vm_key];
+}
+
+struct RecoveryPermit {
+  bool acquired;
+  std::chrono::milliseconds remaining;
+};
+
+RecoveryPermit acquireRecoveryPermit(RebuildGuardEntry& guard, MonotonicTime now) {
+  if (guard.last_recover_time.has_value()) {
+    const auto elapsed = now - guard.last_recover_time.value();
+    if (elapsed < kRecoveryGuardInterval) {
+      const auto remaining = kRecoveryGuardInterval - elapsed;
+      auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+      if (remaining_ms < remaining) {
+        remaining_ms += std::chrono::milliseconds(1);
+      }
+      return {false, remaining_ms};
+    }
+  }
+  guard.last_recover_time = now;
+  return {true, std::chrono::milliseconds(0)};
+}
+
+bool pluginUsesFailOpen(const PluginSharedPtr& plugin) {
+  if (plugin == nullptr) {
+    return false;
+  }
+  const auto& config = plugin->wasmConfig().config();
+  return config.fail_open() || config.failure_policy() == FailurePolicy::FAIL_OPEN;
 }
 #endif
 
@@ -309,6 +403,11 @@ void Wasm::tickHandler(uint32_t root_context_id) {
 }
 
 Wasm::~Wasm() {
+#ifdef HIGRESS
+  ENVOY_BUG(dispatcher_.isThreadSafe(),
+            fmt::format("Wasm owned by dispatcher '{}' was destroyed from another thread",
+                        dispatcher_.name()));
+#endif
   lifecycle_stats_handler_.onEvent(WasmEvent::VmShutDown);
 #ifdef HIGRESS
   if (runtime_stats_timer_) {
@@ -330,14 +429,61 @@ PluginHandleSharedPtrThreadLocal::PluginHandleSharedPtrThreadLocal(PluginHandleS
   initializeReclaimTimer();
 }
 
+PluginHandleSharedPtrThreadLocal::PluginHandleSharedPtrThreadLocal(
+    ThreadLocalPluginResult result, PluginSharedPtr plugin, WasmHandleSharedPtr base_wasm,
+    Event::Dispatcher& dispatcher, WorkerInitStatsHandlerSharedPtr worker_init_stats,
+    bool enable_reclaim_timer, ThreadLocalPluginResultFactory retry_factory,
+    PluginInitializationRole initialization_role, MonotonicTime last_load)
+    : last_load(last_load), plugin_(std::move(plugin)), base_wasm_(std::move(base_wasm)),
+      dispatcher_(&dispatcher),
+      worker_init_stats_(initialization_role == PluginInitializationRole::RequestWorker
+                             ? std::move(worker_init_stats)
+                             : nullptr),
+      retry_factory_(initialization_role == PluginInitializationRole::RequestWorker
+                         ? std::move(retry_factory)
+                         : nullptr),
+      reclaim_timer_enabled_(enable_reclaim_timer),
+      initialization_state_(initialization_role == PluginInitializationRole::RequestWorker &&
+                                    result.handle == nullptr
+                                ? PluginInitializationState::Uninitialized
+                                : PluginInitializationState::Ready),
+      last_initialization_failure_(result.fail_state),
+      initialization_failure_retryable_(initialization_role ==
+                                            PluginInitializationRole::RequestWorker &&
+                                        isRetryableWorkerInitializationFailure(result.fail_state)),
+      initialization_role_(initialization_role),
+      handle_(result.handle != nullptr ? std::move(result.handle)
+                                       : std::make_shared<PluginHandle>(nullptr, plugin_)) {
+  if (initialization_state_ == PluginInitializationState::Uninitialized) {
+    recordInitializationFailure();
+    if (worker_init_stats_ != nullptr) {
+      worker_init_stats_->stats().worker_uninitialized_.inc();
+      counted_uninitialized_ = true;
+    }
+    ENVOY_LOG(warn,
+              "wasm worker initialization failed: plugin='{}' reason='{}' retryable={} "
+              "fail_open={}",
+              plugin_ != nullptr ? plugin_->name_ : "", failStateName(last_initialization_failure_),
+              initialization_failure_retryable_, pluginUsesFailOpen(plugin_));
+  }
+  initializeReclaimTimer();
+}
+
 PluginHandleSharedPtrThreadLocal::~PluginHandleSharedPtrThreadLocal() {
   if (reclaim_timer_) {
     reclaim_timer_->disableTimer();
   }
+  leaveUninitialized();
 }
 
 void PluginHandleSharedPtrThreadLocal::initializeReclaimTimer() {
+  if (initialization_state_ != PluginInitializationState::Ready) {
+    return;
+  }
   if (!reclaim_timer_enabled_) {
+    return;
+  }
+  if (reclaim_timer_ != nullptr) {
     return;
   }
   if (handle_ == nullptr || handle_->wasmHandle() == nullptr ||
@@ -349,7 +495,113 @@ void PluginHandleSharedPtrThreadLocal::initializeReclaimTimer() {
   reclaim_timer_->enableTimer(kReclaimTimerInterval);
 }
 
+void PluginHandleSharedPtrThreadLocal::recordInitializationFailure() {
+  if (worker_init_stats_ == nullptr) {
+    return;
+  }
+  if (initialization_failure_retryable_) {
+    worker_init_stats_->stats().worker_init_retryable_failure_total_.inc();
+  } else {
+    worker_init_stats_->stats().worker_init_terminal_failure_total_.inc();
+  }
+}
+
+void PluginHandleSharedPtrThreadLocal::leaveUninitialized() {
+  if (!counted_uninitialized_) {
+    return;
+  }
+  ASSERT(worker_init_stats_ != nullptr);
+  worker_init_stats_->stats().worker_uninitialized_.dec();
+  counted_uninitialized_ = false;
+}
+
+PluginInitializationRecoveryResult PluginHandleSharedPtrThreadLocal::tryInitialize() {
+  if (initialization_role_ == PluginInitializationRole::MainThread) {
+    return {PluginInitializationRecoveryStatus::TerminalFailure, std::chrono::milliseconds(0)};
+  }
+  if (initialization_state_ != PluginInitializationState::Uninitialized) {
+    return {PluginInitializationRecoveryStatus::Recovered, std::chrono::milliseconds(0)};
+  }
+  if (!initialization_failure_retryable_) {
+    return {PluginInitializationRecoveryStatus::TerminalFailure, std::chrono::milliseconds(0)};
+  }
+  if (dispatcher_ == nullptr || ((base_wasm_ == nullptr || base_wasm_->wasm() == nullptr) &&
+                                 recovery_vm_key_for_testing_.empty())) {
+    ENVOY_BUG(false, "retryable Wasm worker initialization is missing its recovery context");
+    return {PluginInitializationRecoveryStatus::RetryableFailure, std::chrono::milliseconds(0)};
+  }
+
+  const std::string vm_key = recovery_vm_key_for_testing_.empty()
+                                 ? std::string(base_wasm_->wasm()->vm_key())
+                                 : recovery_vm_key_for_testing_;
+  const auto now = effectiveMonotonicTime(*dispatcher_);
+  auto& guard = rebuildGuardEntry(vm_key, now);
+  const auto permit = acquireRecoveryPermit(guard, now);
+  if (!permit.acquired) {
+    ENVOY_LOG(debug,
+              "wasm worker initialization request retry skipped: plugin='{}' "
+              "remaining_cooldown_ms={}",
+              plugin_ != nullptr ? plugin_->name_ : "", permit.remaining.count());
+    return {PluginInitializationRecoveryStatus::CoolingDown, permit.remaining};
+  }
+
+  ++initialization_retry_attempts_;
+  if (worker_init_stats_ != nullptr) {
+    worker_init_stats_->stats().worker_init_retry_total_.inc();
+  }
+  ThreadLocalPluginResult result =
+      retry_factory_ != nullptr
+          ? retry_factory_()
+          : getOrCreateThreadLocalPluginWithResult(base_wasm_, plugin_, *dispatcher_);
+
+  if (result.handle != nullptr) {
+    guard.trackCurrentGeneration(result.handle->wasmHandle());
+    handle_ = std::move(result.handle);
+    initialization_state_ = PluginInitializationState::Ready;
+    last_initialization_failure_ = FailState::Ok;
+    initialization_failure_retryable_ = false;
+    leaveUninitialized();
+    if (worker_init_stats_ != nullptr) {
+      worker_init_stats_->stats().worker_init_recovered_total_.inc();
+    }
+    ENVOY_LOG(info, "wasm worker initialization recovered: plugin='{}' attempt={}",
+              plugin_ != nullptr ? plugin_->name_ : "", initialization_retry_attempts_);
+    initializeReclaimTimer();
+    return {PluginInitializationRecoveryStatus::Recovered, std::chrono::milliseconds(0)};
+  }
+
+  last_initialization_failure_ = result.fail_state;
+  initialization_failure_retryable_ =
+      isRetryableWorkerInitializationFailure(last_initialization_failure_);
+  recordInitializationFailure();
+
+  if (!initialization_failure_retryable_) {
+    ENVOY_LOG(warn,
+              "wasm worker initialization retry became terminal: plugin='{}' reason='{}' "
+              "attempt={} fail_open={}",
+              plugin_ != nullptr ? plugin_->name_ : "", failStateName(last_initialization_failure_),
+              initialization_retry_attempts_, pluginUsesFailOpen(plugin_));
+    return {PluginInitializationRecoveryStatus::TerminalFailure, std::chrono::milliseconds(0)};
+  }
+
+  ENVOY_LOG(debug,
+            "wasm worker initialization request retry failed: plugin='{}' reason='{}' attempt={} "
+            "cooldown_ms={} fail_open={}",
+            plugin_ != nullptr ? plugin_->name_ : "", failStateName(last_initialization_failure_),
+            initialization_retry_attempts_,
+            std::chrono::duration_cast<std::chrono::milliseconds>(kRecoveryGuardInterval).count(),
+            pluginUsesFailOpen(plugin_));
+  return {PluginInitializationRecoveryStatus::RetryableFailure, std::chrono::milliseconds(0)};
+}
+
 void PluginHandleSharedPtrThreadLocal::runReclaimTimerForTesting() { onReclaimTimer(); }
+
+void PluginHandleSharedPtrThreadLocal::recordFailOpenSkip() {
+  if (initialization_state_ == PluginInitializationState::Uninitialized &&
+      pluginUsesFailOpen(plugin_) && worker_init_stats_ != nullptr) {
+    worker_init_stats_->stats().worker_fail_open_skip_total_.inc();
+  }
+}
 
 void PluginHandleSharedPtrThreadLocal::onReclaimTimer() {
   auto rearm = [this]() {
@@ -429,27 +681,20 @@ bool PluginHandleSharedPtrThreadLocal::rebuild(bool is_fail_recovery, RebuildSou
   }
   current_wasm_handle = handle_->wasmHandle();
   current_wasm = current_wasm_handle->wasm();
-  sweepRebuildGuardRegistry(vm_key);
-  auto& guard = rebuild_guard_registry[vm_key];
-  guard.trackCurrentGeneration(current_wasm_handle);
   auto& dispatcher = current_wasm->dispatcher();
-  auto now = effectiveMonotonicTime(dispatcher);
-  if (now - guard.last_recover_time < std::chrono::seconds(MIN_RECOVER_INTERVAL_SECONDS)) {
-    ENVOY_LOG(info, "wasm vm rebuild skipped: recover interval has not been reached");
-    return false;
-  }
+  const auto now = effectiveMonotonicTime(dispatcher);
+  auto& guard = rebuildGuardEntry(vm_key, now);
+  guard.trackCurrentGeneration(current_wasm_handle);
   if (!is_fail_recovery && guard.hasLiveOldGeneration(current_wasm_handle)) {
-    ENVOY_LOG(info, "wasm vm proactive rebuild skipped: live generation cap reached");
+    ENVOY_LOG(debug, "wasm vm proactive rebuild skipped: live generation cap reached");
     return false;
   }
-  const auto active_stream_count = current_wasm->activeStreamCount();
-  if (!is_fail_recovery && active_stream_count > 0) {
-    ENVOY_LOG(info, "wasm vm proactive rebuild skipped: current generation has {} active streams",
-              active_stream_count);
+  const auto permit = acquireRecoveryPermit(guard, now);
+  if (!permit.acquired) {
+    ENVOY_LOG(debug, "wasm vm rebuild skipped: recovery cooldown has {}ms remaining",
+              permit.remaining.count());
     return false;
   }
-  // Even if rebuild fails, it will be retried after the interval
-  guard.last_recover_time = now;
   std::shared_ptr<PluginHandleBase> new_handle;
   if (handle_->rebuild(new_handle) && new_handle != nullptr) {
     auto new_plugin_handle = std::static_pointer_cast<PluginHandle>(new_handle);
@@ -584,6 +829,12 @@ void clearCodeCacheForTesting() {
 
 #if defined(HIGRESS)
 size_t rebuildGuardRegistrySizeForTesting() { return rebuild_guard_registry.size(); }
+
+bool acquireRecoveryPermitForTesting(absl::string_view vm_key, Event::Dispatcher& dispatcher) {
+  const auto now = effectiveMonotonicTime(dispatcher);
+  auto& guard = rebuildGuardEntry(std::string(vm_key), now);
+  return acquireRecoveryPermit(guard, now).acquired;
+}
 #endif
 
 // TODO: remove this post #4160: Switch default to SimulatedTimeSystem.
@@ -613,7 +864,16 @@ getWasmHandleFactory(WasmConfig& wasm_config, const Stats::ScopeSharedPtr& scope
                                        runtime
 #endif
     );
+#ifdef HIGRESS
+    auto handle =
+        WasmHandleSharedPtr(new WasmHandle(std::move(wasm)), [&dispatcher](WasmHandle* handle) {
+          dispatcher.deleteInDispatcherThread(
+              std::make_unique<BaseWasmHandleDispatcherThreadDeletable>(handle));
+        });
+    return std::static_pointer_cast<WasmHandleBase>(std::move(handle));
+#else
     return std::static_pointer_cast<WasmHandleBase>(std::make_shared<WasmHandle>(std::move(wasm)));
+#endif
   };
 }
 
@@ -946,8 +1206,9 @@ PluginConfig::PluginConfig(const envoy::extensions::wasm::v3::PluginConfig& conf
                            Server::Configuration::ServerFactoryContext& context,
                            Stats::Scope& scope, Init::Manager& init_manager,
                            envoy::config::core::v3::TrafficDirection direction,
-                           const envoy::config::core::v3::Metadata* metadata, bool singleton)
-    : is_singleton_handle_(singleton) {
+                           const envoy::config::core::v3::Metadata* metadata, bool singleton,
+                           bool enable_worker_init_recovery)
+    : is_singleton_handle_(singleton), enable_worker_init_recovery_(enable_worker_init_recovery) {
 
   if (config.fail_open()) {
     // If the legacy fail_open is set to true explicitly.
@@ -991,6 +1252,12 @@ PluginConfig::PluginConfig(const envoy::extensions::wasm::v3::PluginConfig& conf
 
   stats_handler_ = std::make_shared<StatsHandler>(scope, absl::StrCat("wasm.", config.name(), "."));
   plugin_ = std::make_shared<Plugin>(config, direction, context.localInfo(), metadata);
+#if defined(HIGRESS)
+  if (enable_worker_init_recovery_) {
+    worker_init_stats_ = std::make_shared<WorkerInitStatsHandler>(
+        scope.createScope(""), config.vm_config().runtime(), plugin_->name_);
+  }
+#endif
 
   auto callback = [this, &context](WasmHandleSharedPtr base_wasm) {
     base_wasm_ = base_wasm;
@@ -1013,7 +1280,24 @@ PluginConfig::PluginConfig(const envoy::extensions::wasm::v3::PluginConfig& conf
     auto thread_local_handle =
         ThreadLocal::TypedSlot<SinglePluginHandle>::makeUnique(context.threadLocal());
     // NB: the Slot set() call doesn't complete inline, so all arguments must outlive this call.
-    thread_local_handle->set([base_wasm, plugin = this->plugin_](Event::Dispatcher& dispatcher) {
+    thread_local_handle->set([base_wasm, plugin = this->plugin_
+#if defined(HIGRESS)
+                              ,
+                              worker_init_stats = worker_init_stats_,
+                              enable_worker_init_recovery = enable_worker_init_recovery_,
+                              main_thread_dispatcher = &context.mainThreadDispatcher()
+#endif
+    ](Event::Dispatcher& dispatcher) {
+#if defined(HIGRESS)
+      if (enable_worker_init_recovery) {
+        return std::make_shared<SinglePluginHandle>(
+            getOrCreateThreadLocalPluginWithResult(base_wasm, plugin, dispatcher), plugin,
+            base_wasm, dispatcher, worker_init_stats, true, nullptr,
+            &dispatcher == main_thread_dispatcher ? PluginInitializationRole::MainThread
+                                                  : PluginInitializationRole::RequestWorker,
+            dispatcher.timeSource().monotonicTime());
+      }
+#endif
       return std::make_shared<SinglePluginHandle>(
           getOrCreateThreadLocalPlugin(base_wasm, plugin, dispatcher)
 #if defined(HIGRESS)
@@ -1046,6 +1330,21 @@ std::shared_ptr<Context> PluginConfig::createContext() {
     return nullptr;
   }
 
+#if defined(HIGRESS)
+  if (enable_worker_init_recovery_ &&
+      plugin_handle_holder->initializationState() == PluginInitializationState::Uninitialized) {
+    const auto recovery = plugin_handle_holder->tryInitialize();
+    if (recovery.status == PluginInitializationRecoveryStatus::Recovered) {
+      wasm = getWasmOrNull(plugin_handle_holder->handle()->wasmHandle());
+    } else if (failure_policy_ == FailurePolicy::FAIL_OPEN) {
+      plugin_handle_holder->recordFailOpenSkip();
+      return nullptr;
+    } else {
+      return std::make_shared<Context>(nullptr, 0, plugin_handle_holder->handle());
+    }
+  }
+#endif
+
   // FAIL_RELOAD is handled by the getPluginHandleAndWasm() call. If the latest
   // wasm is still failed, return nullptr or an empty Context.
   if (!wasm || wasm->isFailed()) {
@@ -1062,6 +1361,25 @@ std::shared_ptr<Context> PluginConfig::createContext() {
 }
 
 Wasm* PluginConfig::wasm() { return getPluginHandleAndWasm().second; }
+#if defined(HIGRESS)
+ThreadLocalPluginResult
+getOrCreateThreadLocalPluginWithResult(const WasmHandleSharedPtr& base_wasm,
+                                       const PluginSharedPtr& plugin, Event::Dispatcher& dispatcher,
+                                       CreateContextFn create_root_context_for_testing) {
+  if (!base_wasm) {
+    return {getOrCreateThreadLocalPlugin(base_wasm, plugin, dispatcher,
+                                         create_root_context_for_testing),
+            FailState::Ok};
+  }
+  auto result = proxy_wasm::getOrCreateThreadLocalPluginWithResult(
+      std::static_pointer_cast<WasmHandle>(base_wasm), plugin,
+      getWasmHandleCloneFactory(dispatcher, create_root_context_for_testing),
+      getPluginHandleFactory());
+  return {result.handle != nullptr ? std::static_pointer_cast<PluginHandle>(result.handle)
+                                   : nullptr,
+          result.fail_state};
+}
+#endif
 
 } // namespace Wasm
 } // namespace Common

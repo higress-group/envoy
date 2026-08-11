@@ -72,7 +72,9 @@ protected:
           retry_timer_cb_ = timer_cb;
           return retry_timer_;
         }))
-        .WillOnce(Invoke([this](Event::TimerCb) { return runtime_stats_timer_; }));
+        .WillOnce(Invoke([this](Event::TimerCb) { return runtime_stats_timer_; }))
+        // The Host canary clone may initialize an additional worker-local runtime-stats timer.
+        .WillRepeatedly(testing::ReturnNew<NiceMock<Event::MockTimer>>());
 #else
     EXPECT_CALL(dispatcher_, createTimer_(_)).WillOnce(Invoke([this](Event::TimerCb timer_cb) {
       retry_timer_cb_ = timer_cb;
@@ -1168,6 +1170,113 @@ TEST_P(WasmFilterConfigTest, FailedToGetThreadLocalPluginOpenPolicy) {
       std::make_shared<Extensions::Common::Wasm::PluginHandleSharedPtrThreadLocal>(nullptr);
   EXPECT_EQ(filter_config->createContext(), nullptr);
 }
+
+#if defined(HIGRESS)
+TEST_P(WasmFilterConfigTest, WorkerInitializationFailureRecoversOnRequestWithOneSecondGuard) {
+  NiceMock<Envoy::ThreadLocal::MockInstance> threadlocal;
+  const std::string yaml = TestEnvironment::substitute(absl::StrCat(R"EOF(
+  config:
+    name: worker_init_request_recovery
+    failure_policy: FAIL_OPEN
+    vm_config:
+      runtime: "envoy.wasm.runtime.)EOF",
+                                                                    std::get<0>(GetParam()), R"EOF("
+      configuration:
+         "@type": "type.googleapis.com/google.protobuf.StringValue"
+         value: "some configuration"
+      code:
+        local:
+          filename: "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"
+  )EOF"));
+
+  envoy::extensions::filters::http::wasm::v3::Wasm proto_config;
+  TestUtility::loadFromYaml(yaml, proto_config);
+  setupContextServerFactoryThreadLocal(threadlocal);
+  threadlocal.registered_ = true;
+  auto filter_config = getFilterConfig(proto_config);
+  ASSERT_EQ(threadlocal.current_slot_, 1);
+  auto ready_wrapper =
+      std::dynamic_pointer_cast<Extensions::Common::Wasm::PluginHandleSharedPtrThreadLocal>(
+          threadlocal.data_[0]);
+  ASSERT_NE(ready_wrapper, nullptr);
+  const auto recovered_handle = ready_wrapper->handle();
+  ASSERT_NE(recovered_handle, nullptr);
+
+  auto worker_scope = Stats::ScopeSharedPtr(stats_store_.createScope(""));
+  auto worker_stats = std::make_shared<Extensions::Common::Wasm::WorkerInitStatsHandler>(
+      worker_scope, proto_config.config().vm_config().runtime(), proto_config.config().name());
+  uint64_t factory_calls = 0;
+  auto retryable_wrapper =
+      std::make_shared<Extensions::Common::Wasm::PluginHandleSharedPtrThreadLocal>(
+          Extensions::Common::Wasm::ThreadLocalPluginResult{nullptr,
+                                                            proxy_wasm::FailState::RuntimeError},
+          filter_config->plugin(), nullptr, dispatcher_, worker_stats, false,
+          [&factory_calls, &recovered_handle]() {
+            ++factory_calls;
+            if (factory_calls == 1) {
+              return Extensions::Common::Wasm::ThreadLocalPluginResult{
+                  nullptr, proxy_wasm::FailState::RuntimeError};
+            }
+            return Extensions::Common::Wasm::ThreadLocalPluginResult{recovered_handle,
+                                                                     proxy_wasm::FailState::Ok};
+          });
+  retryable_wrapper->setRecoveryVmKeyForTesting(absl::StrCat(
+      "config-worker-init-recovery-", std::get<0>(GetParam()), "-", std::get<2>(GetParam())));
+  threadlocal.data_[0] = retryable_wrapper;
+
+  Extensions::Common::Wasm::setTimeOffsetForCodeCacheForTesting(std::chrono::milliseconds(0));
+  EXPECT_EQ(filter_config->createContext(), nullptr);
+  EXPECT_EQ(1, factory_calls);
+  EXPECT_EQ(filter_config->createContext(), nullptr);
+  EXPECT_EQ(1, factory_calls);
+
+  Extensions::Common::Wasm::setTimeOffsetForCodeCacheForTesting(std::chrono::seconds(1));
+  EXPECT_NE(filter_config->createContext(), nullptr);
+  EXPECT_EQ(2, factory_calls);
+  EXPECT_EQ(Extensions::Common::Wasm::PluginInitializationState::Ready,
+            retryable_wrapper->initializationState());
+  Extensions::Common::Wasm::setTimeOffsetForCodeCacheForTesting(std::chrono::milliseconds(0));
+}
+
+TEST_P(WasmFilterConfigTest, TerminalWorkerInitializationFailureHonorsFailClosed) {
+  NiceMock<Envoy::ThreadLocal::MockInstance> threadlocal;
+  const std::string yaml = TestEnvironment::substitute(absl::StrCat(R"EOF(
+  config:
+    name: worker_init_terminal_failure
+    vm_config:
+      runtime: "envoy.wasm.runtime.)EOF",
+                                                                    std::get<0>(GetParam()), R"EOF("
+      configuration:
+         "@type": "type.googleapis.com/google.protobuf.StringValue"
+         value: "some configuration"
+      code:
+        local:
+          filename: "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"
+  )EOF"));
+
+  envoy::extensions::filters::http::wasm::v3::Wasm proto_config;
+  TestUtility::loadFromYaml(yaml, proto_config);
+  setupContextServerFactoryThreadLocal(threadlocal);
+  threadlocal.registered_ = true;
+  auto filter_config = getFilterConfig(proto_config);
+  ASSERT_EQ(threadlocal.current_slot_, 1);
+
+  auto worker_scope = Stats::ScopeSharedPtr(stats_store_.createScope(""));
+  auto worker_stats = std::make_shared<Extensions::Common::Wasm::WorkerInitStatsHandler>(
+      worker_scope, proto_config.config().vm_config().runtime(), proto_config.config().name());
+  auto terminal_wrapper =
+      std::make_shared<Extensions::Common::Wasm::PluginHandleSharedPtrThreadLocal>(
+          Extensions::Common::Wasm::ThreadLocalPluginResult{nullptr,
+                                                            proxy_wasm::FailState::ConfigureFailed},
+          filter_config->plugin(), nullptr, dispatcher_, worker_stats);
+  threadlocal.data_[0] = terminal_wrapper;
+
+  auto context = filter_config->createContext();
+  ASSERT_NE(context, nullptr);
+  EXPECT_EQ(context->wasm(), nullptr);
+  EXPECT_EQ(0, terminal_wrapper->initializationRetryAttemptsForTesting());
+}
+#endif
 
 } // namespace Wasm
 } // namespace HttpFilters
