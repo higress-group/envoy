@@ -74,3 +74,5 @@ node_modules
 dist
 *.bak
 tools/dependency/cve_data
+user*.bazelrc
+clang*.bazelrc

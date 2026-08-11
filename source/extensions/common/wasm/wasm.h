@@ -9,6 +9,7 @@
 #include "envoy/extensions/wasm/v3/wasm.pb.h"
 #include "envoy/extensions/wasm/v3/wasm.pb.validate.h"
 #include "envoy/http/filter.h"
+
 #if defined(HIGRESS)
 #include "envoy/runtime/runtime.h"
 #endif
@@ -209,6 +210,26 @@ using PluginHandleSharedPtr = std::shared_ptr<PluginHandle>;
 
 #if defined(HIGRESS)
 enum class RebuildSource { Explicit, Memory };
+enum class PluginInitializationState { Ready, Uninitialized };
+enum class PluginInitializationRole { RequestWorker, MainThread };
+enum class PluginInitializationRecoveryStatus {
+  Recovered,
+  RetryableFailure,
+  TerminalFailure,
+  CoolingDown
+};
+
+struct PluginInitializationRecoveryResult {
+  PluginInitializationRecoveryStatus status;
+  std::chrono::milliseconds remaining_cooldown{0};
+};
+
+struct ThreadLocalPluginResult {
+  PluginHandleSharedPtr handle;
+  proxy_wasm::FailState fail_state{proxy_wasm::FailState::Ok};
+};
+
+using ThreadLocalPluginResultFactory = std::function<ThreadLocalPluginResult()>;
 
 class PluginHandleSharedPtrThreadLocal : public ThreadLocal::ThreadLocalObject,
                                          public Logger::Loggable<Logger::Id::wasm> {
@@ -218,22 +239,55 @@ public:
   PluginHandleSharedPtrThreadLocal(PluginHandleSharedPtr handle,
                                    WasmHandleSharedPtr base_wasm = nullptr,
                                    bool enable_reclaim_timer = false, MonotonicTime last_load = {});
+  PluginHandleSharedPtrThreadLocal(
+      ThreadLocalPluginResult result, PluginSharedPtr plugin, WasmHandleSharedPtr base_wasm,
+      Event::Dispatcher& dispatcher, WorkerInitStatsHandlerSharedPtr worker_init_stats,
+      bool enable_reclaim_timer = false,
+      // Testing-only override; production retries through
+      // getOrCreateThreadLocalPluginWithResult when this is null.
+      ThreadLocalPluginResultFactory retry_factory = nullptr,
+      PluginInitializationRole initialization_role = PluginInitializationRole::RequestWorker,
+      MonotonicTime last_load = {});
   PluginHandleSharedPtrThreadLocal() = default;
   ~PluginHandleSharedPtrThreadLocal() override;
 
+  PluginInitializationRecoveryResult tryInitialize();
   bool rebuild(bool is_fail_recovery = false, RebuildSource source = RebuildSource::Explicit);
   void runReclaimTimerForTesting();
+  PluginInitializationState initializationState() const { return initialization_state_; }
+  proxy_wasm::FailState lastInitializationFailure() const { return last_initialization_failure_; }
+  bool initializationFailureRetryable() const { return initialization_failure_retryable_; }
+  uint64_t initializationRetryAttemptsForTesting() const { return initialization_retry_attempts_; }
+  bool participatesInWorkerInitialization() const {
+    return initialization_role_ == PluginInitializationRole::RequestWorker;
+  }
+  void setRecoveryVmKeyForTesting(std::string vm_key) {
+    recovery_vm_key_for_testing_ = std::move(vm_key);
+  }
+  void recordFailOpenSkip();
   PluginHandleSharedPtr& handle() { return handle_; }
 
 private:
   void initializeReclaimTimer();
+  void recordInitializationFailure();
+  void leaveUninitialized();
   void onReclaimTimer();
   bool syncHandleToCurrentGeneration(const std::string& vm_key);
 
   PluginSharedPtr plugin_;
   WasmHandleSharedPtr base_wasm_;
+  Event::Dispatcher* dispatcher_{nullptr};
+  WorkerInitStatsHandlerSharedPtr worker_init_stats_;
+  ThreadLocalPluginResultFactory retry_factory_;
   Event::TimerPtr reclaim_timer_;
   bool reclaim_timer_enabled_{};
+  PluginInitializationState initialization_state_{PluginInitializationState::Ready};
+  proxy_wasm::FailState last_initialization_failure_{proxy_wasm::FailState::Ok};
+  bool initialization_failure_retryable_{false};
+  bool counted_uninitialized_{false};
+  uint64_t initialization_retry_attempts_{0};
+  PluginInitializationRole initialization_role_{PluginInitializationRole::RequestWorker};
+  std::string recovery_vm_key_for_testing_;
   static constexpr std::chrono::milliseconds kReclaimTimerInterval{1000};
   PluginHandleSharedPtr handle_{};
 };
@@ -275,10 +329,18 @@ getOrCreateThreadLocalPlugin(const WasmHandleSharedPtr& base_wasm, const PluginS
                              Event::Dispatcher& dispatcher,
                              CreateContextFn create_root_context_for_testing = nullptr);
 
+#if defined(HIGRESS)
+ThreadLocalPluginResult
+getOrCreateThreadLocalPluginWithResult(const WasmHandleSharedPtr& base_wasm,
+                                       const PluginSharedPtr& plugin, Event::Dispatcher& dispatcher,
+                                       CreateContextFn create_root_context_for_testing = nullptr);
+#endif
+
 void clearCodeCacheForTesting();
 void setTimeOffsetForCodeCacheForTesting(MonotonicTime::duration d);
 #if defined(HIGRESS)
 size_t rebuildGuardRegistrySizeForTesting();
+bool acquireRecoveryPermitForTesting(absl::string_view vm_key, Event::Dispatcher& dispatcher);
 #endif
 WasmEvent toWasmEvent(const std::shared_ptr<WasmHandleBase>& wasm);
 
@@ -290,7 +352,8 @@ public:
   PluginConfig(const envoy::extensions::wasm::v3::PluginConfig& config,
                Server::Configuration::ServerFactoryContext& context, Stats::Scope& scope,
                Init::Manager& init_manager, envoy::config::core::v3::TrafficDirection direction,
-               const envoy::config::core::v3::Metadata* metadata, bool singleton);
+               const envoy::config::core::v3::Metadata* metadata, bool singleton,
+               bool enable_worker_init_recovery = false);
 
   std::shared_ptr<Context> createContext();
   Wasm* wasm();
@@ -322,6 +385,10 @@ private:
   PluginSharedPtr plugin_;
   RemoteAsyncDataProviderPtr remote_data_provider_;
   const bool is_singleton_handle_{};
+  const bool enable_worker_init_recovery_{};
+#if defined(HIGRESS)
+  WorkerInitStatsHandlerSharedPtr worker_init_stats_;
+#endif
   WasmHandleSharedPtr base_wasm_{};
   absl::variant<absl::monostate, SinglePluginHandle, ThreadLocalPluginHandle> plugin_handle_;
 };

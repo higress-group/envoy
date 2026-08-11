@@ -1,0 +1,36 @@
+resources:
+- "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+  name: worker_init_ecds_listener
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: __LISTENER_PORT__
+  filter_chains:
+  - filters:
+    - name: envoy.filters.network.http_connection_manager
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+        stat_prefix: worker_init_ecds
+        route_config:
+          name: local_route
+          virtual_hosts:
+          - name: local_service
+            domains: ["*"]
+            routes:
+            - match: {prefix: "/"}
+              route: {cluster: repro_upstream}
+        http_filters:
+        - name: worker_init_repro_filter
+          config_discovery:
+            config_source:
+              path: __WORKDIR__/ecds.yaml
+              resource_api_version: V3
+            apply_default_config_without_warming: true
+            default_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.composite.v3.Composite
+            type_urls:
+            - type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+            - type.googleapis.com/envoy.extensions.filters.http.composite.v3.Composite
+        - name: envoy.filters.http.router
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
