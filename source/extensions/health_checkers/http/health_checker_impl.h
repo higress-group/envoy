@@ -86,6 +86,8 @@ private:
     void onResponseComplete();
     enum class HealthCheckResult { Succeeded, Degraded, Failed, Retriable };
     HealthCheckResult healthCheckResult();
+    void clearResponseState();
+    void invalidateProbeResponse();
     bool shouldClose() const;
 
     // ActiveHealthCheckSession

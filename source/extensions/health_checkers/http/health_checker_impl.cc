@@ -1,5 +1,6 @@
 #include "source/extensions/health_checkers/http/health_checker_impl.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <iterator>
 #include <memory>
@@ -33,6 +34,10 @@ namespace Envoy {
 namespace Upstream {
 
 namespace {
+
+#if defined(HIGRESS)
+constexpr uint64_t StoreMetricsResponseBodyLimit = 64 * 1024;
+#endif
 
 envoy::config::core::v3::RequestMethod
 getMethod(const envoy::config::core::v3::RequestMethod config_method) {
@@ -220,6 +225,23 @@ HttpHealthCheckerImpl::HttpActiveHealthCheckSession::~HttpActiveHealthCheckSessi
   ASSERT(client_ == nullptr);
 }
 
+void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::clearResponseState() {
+  response_headers_.reset();
+  response_body_->drain(response_body_->length());
+}
+
+void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::invalidateProbeResponse() {
+  if (request_in_flight_) {
+    request_in_flight_ = false;
+#if defined(HIGRESS)
+    if (parent_.store_metrics_) {
+      host_->setEndpointMetrics(EMPTY_STRING);
+    }
+#endif
+  }
+  clearResponseState();
+}
+
 void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::onDeferredDelete() {
   if (client_) {
     // If there is an active request it will get reset, so make sure we ignore the reset.
@@ -241,7 +263,12 @@ void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::decodeData(Buffer::Ins
                                                                      bool end_stream) {
 #if defined(HIGRESS)
   if (parent_.store_metrics_) {
-    response_body_->move(data, data.length());
+    const uint64_t retained_length = response_body_->length();
+    const uint64_t remaining = retained_length < StoreMetricsResponseBodyLimit
+                                   ? StoreMetricsResponseBodyLimit - retained_length
+                                   : 0;
+    response_body_->move(data, std::min(data.length(), remaining));
+    data.drain(data.length());
   } else if (parent_.response_buffer_size_ != 0) {
 #else
   if (parent_.response_buffer_size_ != 0) {
@@ -264,11 +291,14 @@ void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::decodeData(Buffer::Ins
 void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::onEvent(Network::ConnectionEvent event) {
   if (event == Network::ConnectionEvent::RemoteClose ||
       event == Network::ConnectionEvent::LocalClose) {
+    if (request_in_flight_) {
+      invalidateProbeResponse();
+    } else {
+      clearResponseState();
+    }
     // For the raw disconnect event, we are either between intervals in which case we already have
     // a timer setup, or we did the close or got a reset, in which case we already setup a new
     // timer. There is nothing to do here other than blow away the client.
-    response_headers_.reset();
-    response_body_->drain(response_body_->length());
     parent_.dispatcher_.deferredDelete(std::move(client_));
   }
 }
@@ -329,12 +359,15 @@ void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::onInterval() {
 
 void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::onResetStream(Http::StreamResetReason,
                                                                         absl::string_view) {
-  request_in_flight_ = false;
   ENVOY_CONN_LOG(debug, "connection/stream error health_flags={}", *client_,
                  HostUtility::healthFlagsToString(*host_));
   if (expect_reset_) {
+    request_in_flight_ = false;
+    clearResponseState();
     return;
   }
+
+  invalidateProbeResponse();
 
   if (client_ && !reuse_connection_) {
     client_->close(Network::ConnectionCloseType::Abort);
@@ -357,6 +390,7 @@ void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::onGoAway(
   }
 
   if (request_in_flight_) {
+    invalidateProbeResponse();
     // Record this as a failed health check.
     handleFailure(envoy::data::core::v3::NETWORK);
   }
@@ -374,8 +408,8 @@ HttpHealthCheckerImpl::HttpActiveHealthCheckSession::healthCheckResult() {
                  HostUtility::healthFlagsToString(*host_));
 
 #if defined(HIGRESS)
-  ENVOY_CONN_LOG(debug, "hc hostname={}, address={} response_body_length={}", 
-    *client_, host_->hostname(), host_->address()->asString(), response_body_->length());
+  ENVOY_CONN_LOG(debug, "hc hostname={}, address={} response_body_length={}", *client_,
+                 host_->hostname(), host_->address()->asString(), response_body_->length());
   host_->setEndpointMetrics(response_body_->toString());
 #endif
 
@@ -450,8 +484,7 @@ void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::onResponseComplete() {
     client_->close(Network::ConnectionCloseType::Abort);
   }
 
-  response_headers_.reset();
-  response_body_->drain(response_body_->length());
+  clearResponseState();
 }
 
 // It is possible for this session to have been deferred destroyed inline in handleFailure()
@@ -469,7 +502,7 @@ bool HttpHealthCheckerImpl::HttpActiveHealthCheckSession::shouldClose() const {
 }
 
 void HttpHealthCheckerImpl::HttpActiveHealthCheckSession::onTimeout() {
-  request_in_flight_ = false;
+  invalidateProbeResponse();
   if (client_) {
     ENVOY_CONN_LOG(debug, "connection/stream timeout health_flags={}", *client_,
                    HostUtility::healthFlagsToString(*host_));

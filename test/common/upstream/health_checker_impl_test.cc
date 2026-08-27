@@ -578,7 +578,6 @@ public:
     addCompletionCallback();
   }
 
-
 #if defined(HIGRESS)
   void setupLLMServiceWithExpectedResponseHC() {
     // Response: Base64 string of "Everything OK".
@@ -591,6 +590,22 @@ public:
     store_metrics: true
     http_health_check:
       path: /metrics
+    )EOF";
+    allocHealthChecker(yaml);
+    addCompletionCallback();
+  }
+
+  void setupLLMServiceWithExpectedResponseHCHttp2() {
+    std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    interval_jitter: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    store_metrics: true
+    http_health_check:
+      path: /metrics
+      codec_client_type: Http2
     )EOF";
     allocHealthChecker(yaml);
     addCompletionCallback();
@@ -7288,6 +7303,210 @@ TEST_F(HttpHealthCheckerImplTest, LLMServiceHealthCheckSuccess) {
   respondBody(0, "200", {"Test Everything OK"});
   EXPECT_EQ(Host::Health::Healthy,
             cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->coarseHealth());
+}
+
+TEST_F(HttpHealthCheckerImplTest, LLMServiceMetricsAtLimitThenShortResponseReplacesValue) {
+  constexpr size_t metrics_limit = 64 * 1024;
+  setupLLMServiceWithExpectedResponseHC();
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged)).Times(2);
+  const HostSharedPtr host = makeTestHost(cluster_->info_, "tcp://127.0.0.1:80");
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {host};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  health_checker_->start();
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _)).Times(2);
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .Times(2)
+      .WillRepeatedly(Return(45000));
+
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  const std::string exact_limit(metrics_limit, 'a');
+  respondBody(0, "200", {exact_limit});
+  EXPECT_EQ(exact_limit, host->getEndpointMetrics());
+  EXPECT_EQ(Host::Health::Healthy, host->coarseHealth());
+
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  expectStreamCreate(0);
+  test_sessions_[0]->interval_timer_->invokeCallback();
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  const std::string short_response = "short metrics response";
+  respondBody(0, "200", {short_response});
+  EXPECT_EQ(short_response, host->getEndpointMetrics());
+  EXPECT_EQ(Host::Health::Healthy, host->coarseHealth());
+}
+
+TEST_F(HttpHealthCheckerImplTest, LLMServiceOversizedSingleChunkMetricsRetainPrefix) {
+  constexpr size_t metrics_limit = 64 * 1024;
+  setupLLMServiceWithExpectedResponseHC();
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
+  const HostSharedPtr host = makeTestHost(cluster_->info_, "tcp://127.0.0.1:80");
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {host};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  health_checker_->start();
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .WillOnce(Return(45000));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+
+  const std::string retained(metrics_limit, 'a');
+  respondBody(0, "200", {retained + std::string(4096, 'b')});
+  EXPECT_EQ(retained, host->getEndpointMetrics());
+  EXPECT_EQ(Host::Health::Healthy, host->coarseHealth());
+}
+
+TEST_F(HttpHealthCheckerImplTest, LLMServiceOversizedChunkedMetricsRetainPrefix) {
+  constexpr size_t metrics_limit = 64 * 1024;
+  setupLLMServiceWithExpectedResponseHC();
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
+  const HostSharedPtr host = makeTestHost(cluster_->info_, "tcp://127.0.0.1:80");
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {host};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  health_checker_->start();
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .WillOnce(Return(45000));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+
+  const std::string first(32 * 1024, 'a');
+  const std::string second(40 * 1024, 'b');
+  const std::string discarded(8 * 1024, 'c');
+  respondBody(0, "200", {first, second, discarded});
+  EXPECT_EQ(first + std::string(metrics_limit - first.size(), 'b'), host->getEndpointMetrics());
+  EXPECT_EQ(Host::Health::Healthy, host->coarseHealth());
+}
+
+TEST_F(HttpHealthCheckerImplTest, LLMServiceTimeoutClearsStoredMetrics) {
+  setupLLMServiceWithExpectedResponseHC();
+  const HostSharedPtr host = makeTestHost(cluster_->info_, "tcp://127.0.0.1:80");
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {host};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  health_checker_->start();
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _)).Times(2);
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .Times(2)
+      .WillRepeatedly(Return(45000));
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respondBody(0, "200", {"current metrics"});
+  EXPECT_EQ("current metrics", host->getEndpointMetrics());
+
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  expectStreamCreate(0);
+  test_sessions_[0]->interval_timer_->invokeCallback();
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::ChangePending));
+  EXPECT_CALL(*test_sessions_[0]->client_connection_, close(Network::ConnectionCloseType::Abort));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  EXPECT_CALL(event_logger_, logUnhealthy(_, _, _, true));
+  test_sessions_[0]->timeout_timer_->invokeCallback();
+  EXPECT_TRUE(host->getEndpointMetrics().empty());
+}
+
+TEST_F(HttpHealthCheckerImplTest, LLMServiceStreamResetClearsResponseBeforeNextProbe) {
+  setupLLMServiceWithExpectedResponseHC();
+  const HostSharedPtr host = makeTestHost(cluster_->info_, "tcp://127.0.0.1:80");
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {host};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  health_checker_->start();
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _)).Times(3);
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .Times(3)
+      .WillRepeatedly(Return(45000));
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged)).Times(2);
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respondBody(0, "200", {"current metrics"});
+  EXPECT_EQ("current metrics", host->getEndpointMetrics());
+
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  expectStreamCreate(0);
+  test_sessions_[0]->interval_timer_->invokeCallback();
+  auto response_headers =
+      Http::ResponseHeaderMapPtr{new Http::TestResponseHeaderMapImpl{{":status", "200"}}};
+  test_sessions_[0]->stream_response_callbacks_->decodeHeaders(std::move(response_headers), false);
+  Buffer::OwnedImpl partial_response("stale partial metrics");
+  test_sessions_[0]->stream_response_callbacks_->decodeData(partial_response, false);
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::ChangePending));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  EXPECT_CALL(event_logger_, logUnhealthy(_, _, _, true));
+  test_sessions_[0]->request_encoder_.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+  EXPECT_TRUE(host->getEndpointMetrics().empty());
+
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  expectStreamCreate(0);
+  test_sessions_[0]->interval_timer_->invokeCallback();
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respondBody(0, "200", {"fresh metrics"});
+  EXPECT_EQ("fresh metrics", host->getEndpointMetrics());
+  EXPECT_EQ(Host::Health::Healthy, host->coarseHealth());
+}
+
+TEST_F(HttpHealthCheckerImplTest, LLMServiceErrorGoAwayClearsResponseBeforeNextProbe) {
+  setupLLMServiceWithExpectedResponseHCHttp2();
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("health_check.verify_cluster", 100))
+      .WillRepeatedly(Return(false));
+  const HostSharedPtr host = makeTestHost(cluster_->info_, "tcp://127.0.0.1:80");
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {host};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  health_checker_->start();
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _)).Times(3);
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .Times(3)
+      .WillRepeatedly(Return(45000));
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged)).Times(2);
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respondBody(0, "200", {"current metrics"});
+  EXPECT_EQ("current metrics", host->getEndpointMetrics());
+
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  expectStreamCreate(0);
+  test_sessions_[0]->interval_timer_->invokeCallback();
+  auto response_headers =
+      Http::ResponseHeaderMapPtr{new Http::TestResponseHeaderMapImpl{{":status", "200"}}};
+  test_sessions_[0]->stream_response_callbacks_->decodeHeaders(std::move(response_headers), false);
+  Buffer::OwnedImpl partial_response("discarded metrics");
+  test_sessions_[0]->stream_response_callbacks_->decodeData(partial_response, false);
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::ChangePending));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  EXPECT_CALL(event_logger_, logUnhealthy(_, _, _, true));
+  test_sessions_[0]->codec_client_->raiseGoAway(Http::GoAwayErrorCode::Other);
+  EXPECT_TRUE(host->getEndpointMetrics().empty());
+
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  expectClientCreate(0);
+  expectStreamCreate(0);
+  test_sessions_[0]->interval_timer_->invokeCallback();
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respondBody(0, "200", {"fresh metrics"});
+  EXPECT_EQ("fresh metrics", host->getEndpointMetrics());
+  EXPECT_EQ(Host::Health::Healthy, host->coarseHealth());
 }
 #endif
 
