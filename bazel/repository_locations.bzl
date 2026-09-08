@@ -709,9 +709,9 @@ REPOSITORY_LOCATIONS_SPEC = dict(
         # https://github.com/adrian-thurston/colm/commit/fc61ecb3a22b89864916ec538eaf04840e7dd6b5).
         # TODO(zhxie): Update to the next release version when it is released.
         version = "2d8ba76ddaf6634f285d0a81ee42d5ee77d084cf",
-        sha256 = "0399e9bef7603a8f3d94acd0b0af6b5944cc3103e586734719379d3ec09620c0",
-        strip_prefix = "colm-{version}",
-        urls = ["https://github.com/adrian-thurston/colm/archive/{version}.tar.gz"],
+        sha256 = "f11e62f0e7fd8b26f75a9034af43fd4622a0829b29a7cfb70c0742959bd9cfec",
+        strip_prefix = "colm-suite-{version}",
+        urls = ["https://github.com/adrian-thurston/colm-suite/archive/{version}.tar.gz"],
         use_category = ["dataplane_ext"],
         extensions = [
             "envoy.matching.input_matchers.hyperscan",
@@ -719,6 +719,8 @@ REPOSITORY_LOCATIONS_SPEC = dict(
         ],
         release_date = "2021-12-28",
         cpe = "N/A",
+        license = "MIT",
+        license_url = "https://github.com/adrian-thurston/colm-suite/blob/{version}/COPYING",
     ),
     net_colm_open_source_ragel = dict(
         project_name = "Ragel",
@@ -1301,20 +1303,20 @@ REPOSITORY_LOCATIONS_SPEC = dict(
         license = "BSD-3-Clause",
         license_url = "https://github.com/google/quiche/blob/{version}/LICENSE",
     ),
-    com_googlesource_googleurl = dict(
+    googleurl = dict(
         project_name = "Chrome URL parsing library",
         project_desc = "Chrome URL parsing library",
-        project_url = "https://quiche.googlesource.com/googleurl",
+        project_url = "https://github.com/google/gurl",
         version = "dd4080fec0b443296c0ed0036e1e776df8813aa7",
-        sha256 = "fc694942e8a7491dcc1dde1bddf48a31370a1f46fef862bc17acf07c34dc6325",
-        # Static snapshot of https://quiche.googlesource.com/googleurl/+archive/dd4080fec0b443296c0ed0036e1e776df8813aa7.tar.gz
-        urls = ["https://storage.googleapis.com/quiche-envoy-integration/{version}.tar.gz"],
+        sha256 = "4ffa45a827646692e7b26e2a8c0dcbc1b1763a26def2fbbd82362970962a2fcf",
+        urls = ["https://github.com/google/gurl/archive/{version}.tar.gz"],
+        strip_prefix = "gurl-{version}",
         use_category = ["controlplane", "dataplane_core"],
         extensions = [],
         release_date = "2022-11-03",
         cpe = "N/A",
-        license = "googleurl",
-        license_url = "https://quiche.googlesource.com/googleurl/+/{version}/LICENSE",
+        license = "BSD-3-Clause",
+        license_url = "https://github.com/google/gurl/blob/{version}/LICENSE",
     ),
     com_google_cel_spec = dict(
         project_name = "Common Expression Language (CEL) spec",
@@ -1486,11 +1488,11 @@ REPOSITORY_LOCATIONS_SPEC = dict(
         project_name = "Kafka (server binary)",
         project_desc = "Open-source distributed event streaming platform",
         project_url = "https://kafka.apache.org",
-        version = "3.9.1",
-        sha256 = "dd4399816e678946cab76e3bd1686103555e69bc8f2ab8686cda71aa15bc31a3",
+        version = "3.9.2",
+        sha256 = "d5d951c22484f9a0908b05563bc80a042de9779df1e06a89f77d27ceb5f68323",
         strip_prefix = "kafka_2.13-{version}",
         urls = ["https://downloads.apache.org/kafka/{version}/kafka_2.13-{version}.tgz"],
-        release_date = "2025-05-19",
+        release_date = "2026-02-22",
         use_category = ["test_only"],
     ),
     proxy_wasm_cpp_sdk = dict(
