@@ -3,9 +3,15 @@
 #include <openssl/ssl.h>
 #include <openssl/x509_vfy.h>
 
+#include <chrono>
 #include <cstddef>
 #include <initializer_list>
 #include <memory>
+
+#include "source/common/quic/envoy_quic_client_connection.h"
+#include "source/common/quic/envoy_quic_packet_writer.h"
+
+#include "quiche/quic/core/quic_packet_writer_wrapper.h"
 
 namespace Envoy {
 
@@ -584,6 +590,95 @@ TEST_P(QuicHttpIntegrationTest, Http3ClientKeepalive) {
   ASSERT_TRUE(response->complete());
   // First 6 PING frames should be sent every 1s, and the following ones less frequently.
   EXPECT_LE(quic_connection_->GetStats().ping_frames_sent, 8u);
+}
+
+class ReorderingTestWriter : public quic::QuicPacketWriterWrapper {
+public:
+  quic::WriteResult WritePacket(const char* buffer, size_t buf_len,
+                                const quic::QuicIpAddress& self_address,
+                                const quic::QuicSocketAddress& peer_address,
+                                quic::PerPacketOptions* options,
+                                const quic::QuicPacketWriterParams& params) override {
+    if (hold_packets_) {
+      held_packets_.emplace_back(buffer, buf_len);
+      self_address_ = self_address;
+      peer_address_ = peer_address;
+      return quic::WriteResult(quic::WRITE_STATUS_OK, buf_len);
+    }
+    return quic::QuicPacketWriterWrapper::WritePacket(buffer, buf_len, self_address, peer_address,
+                                                      options, params);
+  }
+
+  void flushHeldPackets() {
+    for (const auto& packet : held_packets_) {
+      quic::QuicPacketWriterWrapper::WritePacket(packet.data(), packet.size(), self_address_,
+                                                 peer_address_, nullptr,
+                                                 quic::QuicPacketWriterParams());
+    }
+    held_packets_.clear();
+  }
+
+  bool hold_packets_{false};
+  std::vector<std::string> held_packets_;
+  quic::QuicIpAddress self_address_;
+  quic::QuicSocketAddress peer_address_;
+};
+
+TEST_P(QuicHttpIntegrationTest, DatagramAfterRequestCompleteUaf) {
+  config_helper_.addConfigModifier(
+      [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) -> void {
+        auto* route = hcm.mutable_route_config()->mutable_virtual_hosts(0)->mutable_routes(0);
+        auto* direct_response = route->mutable_direct_response();
+        direct_response->set_status(200);
+        direct_response->mutable_body()->set_inline_string("foo");
+      });
+
+  Http::TestRequestHeaderMapImpl request_headers{{":method", "GET"},
+                                                 {":scheme", "https"},
+                                                 {":authority", "example.com"},
+                                                 {":path", "/"},
+                                                 {"capsule-protocol", "?1"}};
+
+  initialize();
+  codec_client_ = makeHttpConnection(makeClientConnection(lookupPort("http")));
+  auto* quic_session = static_cast<EnvoyQuicClientSession*>(codec_client_->connection());
+  ASSERT_NE(quic_session, nullptr);
+  auto* client_connection = static_cast<EnvoyQuicClientConnection*>(quic_session->connection());
+  auto real_writer =
+      std::make_unique<EnvoyQuicPacketWriter>(std::make_unique<Network::UdpDefaultWriter>(
+          client_connection->connectionSocket()->ioHandle()));
+  auto* delaying_writer = new ReorderingTestWriter();
+  delaying_writer->set_writer(real_writer.release());
+  client_connection->SetQuicPacketWriter(delaying_writer, true);
+
+  auto response = codec_client_->makeHeaderOnlyRequest(request_headers);
+
+  // Hold any ACK packets so that the QUIC stream remains alive in Envoy while the Envoy HTTP
+  // decoder gets destroyed.
+  delaying_writer->hold_packets_ = true;
+  response->waitForHeaders();
+  EXPECT_EQ("200", response->headers().getStatusValue());
+
+  delaying_writer->hold_packets_ = false;
+  uint64_t stream_id_to_write = 0;
+  std::string payload = "AAAAAAAA";
+  size_t slice_length = quic::QuicDataWriter::GetVarInt62Len(stream_id_to_write) + payload.length();
+  quiche::QuicheBuffer buffer(quic_session->connection()->helper()->GetStreamSendBufferAllocator(),
+                              slice_length);
+  quic::QuicDataWriter writer(slice_length, buffer.data());
+  writer.WriteVarInt62(stream_id_to_write);
+  writer.WriteBytes(payload.data(), payload.length());
+  quiche::QuicheMemSlice slice(std::move(buffer));
+  quic_session->SendDatagram(std::move(slice));
+
+  Event::TimerPtr timer(dispatcher_->createTimer([this, delaying_writer]() -> void {
+    delaying_writer->flushHeldPackets();
+    dispatcher_->exit();
+  }));
+  timer->enableTimer(std::chrono::milliseconds(1));
+  dispatcher_->run(Event::Dispatcher::RunType::Block);
+  cleanupUpstreamAndDownstream();
 }
 
 TEST_P(QuicHttpIntegrationTest, Http3ClientKeepaliveDisabled) {
@@ -2008,6 +2103,46 @@ TEST_P(QuicHttpIntegrationTest, QuicListenerFilterReceivesFirstPacketWithCmsg) {
   EXPECT_GT(std::stoi(metrics.at(1)), 0);
   // first packet has packet headers length greater than zero.
   EXPECT_GT(std::stoi(metrics.at(2)), 0);
+}
+
+TEST_P(QuicHttpIntegrationTest, InconsistentContentLengthHeadersOnlyDisabled) {
+  useAccessLog("%RESPONSE_CODE% %RESPONSE_CODE_DETAILS% %RESPONSE_FLAGS%");
+  autonomous_upstream_ = true;
+  autonomous_allow_incomplete_streams_ = true;
+
+  // Adjust stream idle timeout to 1 second to timeout faster during request hanging.
+  config_helper_.addConfigModifier(
+      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+             hcm) { hcm.mutable_stream_idle_timeout()->set_seconds(1); });
+
+  config_helper_.addRuntimeOverride(
+      "envoy.reloadable_features.quic_validate_headers_only_content_length", "false");
+
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"},
+      {":path", "/test/long/url"},
+      {":authority", "sni.lyft.com"},
+      {":scheme", "http"},
+      {"content-length", "10"} // Inconsistent content-length
+  };
+
+  auto response = codec_client_->makeHeaderOnlyRequest(request_headers);
+
+  // Since the flag is disabled, Envoy forwards the request to the H1 backend.
+  // The autonomous upstream will receive it, but will hang waiting for the body.
+  // Envoy's stream idle timeout should trigger after 1s and return 504 Gateway Timeout.
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("504", response->headers().getStatusValue());
+
+  // Verify access log contains 504 response code, stream_idle_timeout, and SI flag (entry index 0)
+  std::string log = waitForAccessLog(access_log_name_, 0);
+  EXPECT_THAT(log, testing::HasSubstr("504 stream_idle_timeout SI"));
+
+  codec_client_->close();
 }
 
 } // namespace Quic

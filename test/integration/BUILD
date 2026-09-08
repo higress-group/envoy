@@ -54,6 +54,24 @@ envoy_cc_test_library(
 )
 
 envoy_cc_test(
+    name = "allocate_conn_pool_integration_test",
+    srcs = select({
+        "//bazel:disable_http3": [],
+        "//conditions:default": ["allocate_conn_pool_integration_test.cc"],
+    }),
+    deps = [
+        ":http_integration_lib",
+        "//test/test_common:utility_lib",
+        "@envoy_api//envoy/extensions/transport_sockets/quic/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/transport_sockets/tls/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/upstreams/http/v3:pkg_cc_proto",
+    ] + envoy_select_enable_http3([
+        "//source/common/quic:quic_client_factory_lib",
+        "//source/extensions/upstreams/http:config",
+    ]),
+)
+
+envoy_cc_test(
     name = "ads_integration_test",
     size = "large",
     srcs = envoy_select_admin_functionality(
@@ -1608,12 +1626,9 @@ envoy_cc_test_library(
 
 envoy_cc_test(
     name = "websocket_integration_test",
-    size = "large",
     srcs = ["websocket_integration_test.cc"],
-    rbe_pool = "2core",
-    tags = [
-        "cpu:3",
-    ],
+    rbe_pool = "linux_x64_small",
+    shard_count = 8,
     deps = [
         ":http_protocol_integration_lib",
         ":websocket_integration_test_lib",
@@ -1665,9 +1680,8 @@ envoy_cc_test(
 
 envoy_cc_test(
     name = "load_stats_integration_test",
-    size = "large",
     srcs = ["load_stats_integration_test.cc"],
-    rbe_pool = "4core",
+    rbe_pool = "linux_x64_medium",
     deps = [
         ":http_integration_lib",
         "//test/config:utility_lib",
@@ -1792,8 +1806,16 @@ envoy_cc_test(
     ],
     deps = [
         ":http_integration_lib",
+        "//envoy/http:codes_interface",
+        "//envoy/http:filter_interface",
+        "//envoy/registry",
+        "//envoy/server:filter_config_interface",
+        "//source/common/runtime:runtime_features_lib",
+        "//source/extensions/filters/http/common:pass_through_filter_lib",
         "//test/common/grpc:grpc_client_integration_lib",
         "//test/config:v2_link_hacks",
+        "//test/extensions/filters/http/common:empty_http_filter_config_lib",
+        "//test/integration/filters:test_filters_proto_cc_proto",
         "@envoy_api//envoy/service/runtime/v3:pkg_cc_proto",
     ],
 )
@@ -2933,7 +2955,9 @@ envoy_cc_test(
 
 envoy_cc_test(
     name = "ads_lrs_grpc_client_cache_integration_test",
+    size = "large",
     srcs = ["ads_lrs_grpc_client_cache_integration_test.cc"],
+    rbe_pool = "linux_x64_small",
     deps = [
         ":http_integration_lib",
         "//test/test_common:test_runtime_lib",

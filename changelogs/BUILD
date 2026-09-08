@@ -1,12 +1,16 @@
 licenses(["notice"])  # Apache 2
 
 exports_files([
-    "sections.yaml",
+    "changelogs.yaml",
 ])
 
 filegroup(
     name = "changelogs",
-    srcs = glob(["*.*.*.yaml"]) + ["current.yaml"],
+    srcs = glob([
+        "*.*.*.yaml",
+        "current/**/*.rst",
+        "current/PLACEHOLDER.txt",
+    ]) + ["changelogs.yaml"],
     visibility = ["//visibility:public"],
 )
 

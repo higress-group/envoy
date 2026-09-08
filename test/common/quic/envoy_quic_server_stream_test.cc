@@ -8,6 +8,7 @@
 #include "source/common/quic/envoy_quic_server_connection.h"
 #include "source/common/quic/envoy_quic_server_session.h"
 #include "source/common/quic/envoy_quic_server_stream.h"
+#include "source/common/quic/envoy_quic_utils.h"
 #include "source/server/active_listener_base.h"
 
 #include "test/common/quic/test_utils.h"
@@ -911,6 +912,28 @@ TEST_F(EnvoyQuicServerStreamTest, DecodeHttp3Datagram) {
   EXPECT_CALL(stream_decoder_, decodeData(BufferStringEqual(capsule_fragment_), _));
   quic_session_.OnDatagramReceived(datagram_fragment_);
 }
+
+TEST_F(EnvoyQuicServerStreamTest, DropDatagramAfterStreamRecreation) {
+  auto valid_indicator = std::make_shared<bool>(true);
+  std::weak_ptr<bool> weak_ind = valid_indicator;
+
+  EXPECT_CALL(stream_decoder_, getRequestDecoderHandle()).WillRepeatedly(Invoke([weak_ind, this]() {
+    auto handle = std::make_unique<NiceMock<Http::MockRequestDecoderHandle>>();
+    ON_CALL(*handle, get()).WillByDefault(Invoke([weak_ind, this]() {
+      if (weak_ind.expired())
+        return OptRef<Http::RequestDecoder>();
+      return OptRef<Http::RequestDecoder>(stream_decoder_);
+    }));
+    return handle;
+  }));
+
+  setUpCapsuleProtocol(true, false);
+
+  valid_indicator.reset();
+
+  EXPECT_CALL(stream_decoder_, decodeData(_, _)).Times(0);
+  quic_session_.OnDatagramReceived(datagram_fragment_);
+}
 #endif
 
 TEST_F(EnvoyQuicServerStreamTest, RegularHeaderBeforePseudoHeader) {
@@ -941,6 +964,64 @@ TEST_F(EnvoyQuicServerStreamTest, DuplicatedPathHeader) {
   EXPECT_CALL(quic_session_, MaybeSendStopSendingFrame(_, _));
   EXPECT_CALL(quic_session_, MaybeSendRstStreamFrame(_, _, _));
   quic_stream_->OnStreamHeaderList(true, 0, header_list);
+}
+
+TEST_F(EnvoyQuicServerStreamTest, InconsistentContentLengthHeadersOnly) {
+  Runtime::maybeSetRuntimeGuard(
+      "envoy.reloadable_features.quic_validate_headers_only_content_length", true);
+  EXPECT_CALL(stream_decoder_, decodeHeaders_(_, _)).Times(0);
+  EXPECT_CALL(quic_session_, MaybeSendStopSendingFrame(_, _));
+  EXPECT_CALL(quic_session_, MaybeSendRstStreamFrame(_, _, _));
+  EXPECT_CALL(stream_callbacks_, onResetStream(Http::StreamResetReason::ProtocolError, _));
+
+  quiche::HttpHeaderBlock spdy_headers;
+  spdy_headers[":authority"] = host_;
+  spdy_headers[":method"] = "GET";
+  spdy_headers[":path"] = "/";
+  spdy_headers[":scheme"] = "https";
+  spdy_headers["content-length"] = "10"; // Non-zero content-length
+
+  std::string payload = spdyHeaderToHttp3StreamPayload(spdy_headers);
+  quic::QuicStreamFrame frame(stream_id_, true, 0, payload); // fin = true
+  quic_stream_->OnStreamFrame(frame);
+
+  EXPECT_TRUE(quic_stream_->rst_sent());
+  EXPECT_EQ(Http3ResponseCodeDetailValues::inconsistent_content_length,
+            quic_stream_->responseDetails());
+}
+
+TEST_F(EnvoyQuicServerStreamTest, InconsistentContentLengthHeadersOnlyDisabled) {
+  // Disable the runtime flag
+  Runtime::maybeSetRuntimeGuard(
+      "envoy.reloadable_features.quic_validate_headers_only_content_length", false);
+
+  // Since the flag is disabled, we expect decodeHeaders to be called with end_stream = true,
+  // and no reset to happen.
+  EXPECT_CALL(stream_decoder_, decodeHeaders_(_, /*end_stream=*/true))
+      .WillOnce(Invoke([this](const Http::RequestHeaderMapSharedPtr& headers, bool) {
+        EXPECT_EQ(host_, headers->getHostValue());
+        EXPECT_EQ("/", headers->getPathValue());
+        EXPECT_EQ(Http::Headers::get().MethodValues.Get, headers->getMethodValue());
+      }));
+  EXPECT_CALL(quic_session_, MaybeSendStopSendingFrame(_, _)).Times(0);
+  EXPECT_CALL(quic_session_, MaybeSendRstStreamFrame(_, _, _)).Times(0);
+  EXPECT_CALL(stream_callbacks_, onResetStream(_, _)).Times(0);
+
+  quiche::HttpHeaderBlock spdy_headers;
+  spdy_headers[":authority"] = host_;
+  spdy_headers[":method"] = "GET";
+  spdy_headers[":path"] = "/";
+  spdy_headers[":scheme"] = "https";
+  spdy_headers["content-length"] = "10"; // Non-zero content-length
+
+  std::string payload = spdyHeaderToHttp3StreamPayload(spdy_headers);
+  quic::QuicStreamFrame frame(stream_id_, true, 0, payload); // fin = true
+  quic_stream_->OnStreamFrame(frame);
+
+  EXPECT_FALSE(quic_stream_->rst_sent());
+
+  // Fully close the stream by sending response headers with FIN
+  quic_stream_->encodeHeaders(response_headers_, /*end_stream=*/true);
 }
 
 } // namespace Quic

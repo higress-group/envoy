@@ -1412,6 +1412,11 @@ public:
    * for this route configuration.
    */
   virtual const Envoy::Config::TypedMetadata& typedMetadata() const PURE;
+
+  /**
+   * @return bool whether to ignore path parameters in path matching.
+   */
+  virtual bool ignorePathParametersInPathMatching() const PURE;
 };
 
 struct VirtualHostRoute {
@@ -1507,6 +1512,8 @@ public:
    */
   virtual bool valid() const PURE;
 };
+
+using GenericConnPoolPtr = std::unique_ptr<GenericConnPool>;
 
 /**
  * An API for the interactions the upstream stream needs to have with the downstream stream
@@ -1635,8 +1642,6 @@ public:
    */
   virtual const StreamInfo::BytesMeterSharedPtr& bytesMeter() PURE;
 };
-
-using GenericConnPoolPtr = std::unique_ptr<GenericConnPool>;
 
 /*
  * A factory for creating generic connection pools.

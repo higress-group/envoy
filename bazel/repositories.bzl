@@ -557,7 +557,13 @@ def _com_github_nghttp2_nghttp2():
         # This patch cannot be picked up due to ABI rules. Discussion at;
         # https://github.com/nghttp2/nghttp2/pull/1395
         # https://github.com/envoyproxy/envoy/pull/8572#discussion_r334067786
-        patches = ["@envoy//bazel/foreign_cc:nghttp2.patch"],
+        patches = [
+            "@envoy//bazel/foreign_cc:nghttp2.patch",
+            "@envoy//bazel/foreign_cc:nghttp2-CVE-2026-27135_part1.diff",
+            "@envoy//bazel/foreign_cc:nghttp2-CVE-2026-27135_part2.diff",
+            "@envoy//bazel/foreign_cc:nghttp2-CVE-2026-27135_part3.diff",
+            "@envoy//bazel/foreign_cc:nghttp2-CVE-2026-27135_part4.diff",
+        ],
     )
     native.bind(
         name = "nghttp2",
@@ -601,11 +607,7 @@ def _com_github_skyapm_cpp2sky():
         patches = ["@envoy//bazel:com_github_skyapm_cpp2sky.patch"],
         patch_args = ["-p1"],
     )
-    external_http_archive(
-        name = "skywalking_data_collect_protocol",
-        patches = ["@envoy//bazel:skywalking_data_collect_protocol.patch"],
-        patch_args = ["-p1"],
-    )
+    external_http_archive("skywalking_data_collect_protocol")
     native.bind(
         name = "cpp2sky",
         actual = "@com_github_skyapm_cpp2sky//source:cpp2sky_data_lib",
@@ -873,6 +875,12 @@ def _intel_ittapi():
 def _com_github_google_quiche():
     external_http_archive(
         name = "com_github_google_quiche",
+        patch_args = ["-p1"],
+        patches = [
+            "@envoy//bazel:quiche.patch",
+            "@envoy//bazel/external:oghttp2_trailer_fix.patch",
+        ],
+        patch_tool = "patch",
         patch_cmds = ["find quiche/ -type f -name \"*.bazel\" -delete"],
         build_file = "@envoy//bazel/external:quiche.BUILD",
     )
@@ -1085,13 +1093,6 @@ filegroup(
         # For now, let's just drop this dependency from Kafka, as it's used only for monitoring.
         patches = ["@envoy//bazel/foreign_cc:librdkafka.patch"],
         patch_args = ["-p1"],
-    )
-
-    # This archive provides Kafka (and Zookeeper) binaries, that are used during Kafka integration
-    # tests.
-    external_http_archive(
-        name = "kafka_server_binary",
-        build_file_content = BUILD_ALL_CONTENT,
     )
 
 def _com_github_fdio_vpp_vcl():
