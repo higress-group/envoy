@@ -189,6 +189,14 @@ void EnvoyQuicClientStream::OnInitialHeadersComplete(bool fin, size_t frame_len,
     return;
   }
 
+  if (fin && Runtime::runtimeFeatureEnabled(
+                 "envoy.reloadable_features.quic_validate_headers_only_content_length")) {
+    updateReceivedContentBytes(0, true);
+    if (stream_error() != quic::QUIC_STREAM_NO_ERROR) {
+      return;
+    }
+  }
+
   const absl::optional<uint64_t> optional_status =
       Http::Utility::getResponseStatusOrNullopt(*headers);
 #ifndef ENVOY_ENABLE_UHV
@@ -498,7 +506,8 @@ bool EnvoyQuicClientStream::hasPendingData() { return BufferedDataBytes() > 0; }
 // connect-udp".
 void EnvoyQuicClientStream::useCapsuleProtocol() {
   http_datagram_handler_ = std::make_unique<HttpDatagramHandler>(*this);
-  http_datagram_handler_->setStreamDecoder(getResponseDecoder());
+  http_datagram_handler_->setStreamDecoderProvider(
+      [this]() -> Http::StreamDecoder* { return getResponseDecoder(); });
   RegisterHttp3DatagramVisitor(http_datagram_handler_.get());
 }
 #endif

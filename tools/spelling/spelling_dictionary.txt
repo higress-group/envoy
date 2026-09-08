@@ -3,6 +3,7 @@
 # will accept title case (e.g. lyft matches Lyft). Prefixes (e.g., un-) or suffixes (e.g. -ing)
 # are allowed for any otherwise correctly spelled word.
 
+FCS
 addrlen
 itr
 STREQ
@@ -51,6 +52,8 @@ BPF
 Bdecoded
 Bencoded
 CIO
+CBC
+cbc
 cbegin
 cend
 constness
@@ -60,6 +63,7 @@ DFP
 Dynatrace
 DOM
 DONTFRAG
+dotdot
 Gasd
 GiB
 IPTOS
@@ -100,6 +104,7 @@ ETX
 FS
 FIXME
 decrypted
+decrypts
 gperf
 HEXDIG
 HEXDIGIT
@@ -379,6 +384,7 @@ PERF
 PGV
 PID
 PKCE
+PKCS
 PKCS12
 PKTINFO
 PNG
@@ -660,6 +666,7 @@ ci
 ciphersuite
 ciphersuites
 ciphertext
+ciphertexts
 circllhist
 clientcert
 cloneable
@@ -705,6 +712,7 @@ ctad
 ctor
 ctrl
 customizations
+cutover
 darwin
 datadog
 datagram

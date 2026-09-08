@@ -680,11 +680,17 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::RequestHeaderMap& headers,
     if (host_selection_response.cancelable) {
       host_selection_response.cancelable->cancel();
     }
+
+    GenericConnPoolPtr generic_conn_pool = createConnPoolOrHandleFailure(
+        std::move(host_selection_response.host), cluster, host_selection_response.details);
+    if (generic_conn_pool == nullptr) {
+      return Http::FilterHeadersStatus::StopIteration;
+    }
+
     // This branch handles the common case of synchronous host selection, as
     // well as handling unsupported asynchronous host selection by treating it
     // as host selection failure and calling sendNoHealthyUpstreamResponse.
-    continueDecodeHeaders(cluster, headers, end_stream, std::move(host_selection_response.host),
-                          std::string(host_selection_response.details));
+    continueDecodeHeaders(headers, end_stream, std::move(generic_conn_pool));
     return Http::FilterHeadersStatus::StopIteration;
   }
 
@@ -693,13 +699,12 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::RequestHeaderMap& headers,
   // like stream timeout.
   host_selection_cancelable_ = std::move(host_selection_response.cancelable);
   // Configure a callback to be called on asynchronous host selection.
-  on_host_selected_ = ([this, cluster, end_stream](Upstream::HostConstSharedPtr&& host,
-                                                   std::string host_selection_details) -> void {
+  on_host_selected_ = ([this, end_stream](GenericConnPoolPtr generic_conn_pool) -> void {
     // It should always be safe to call continueDecodeHeaders. In the case the
     // stream had a local reply before host selection completed,
     // the lookup should be canceled.
-    const bool should_continue_decoding = continueDecodeHeaders(
-        cluster, *downstream_headers_, end_stream, std::move(host), host_selection_details);
+    const bool should_continue_decoding =
+        continueDecodeHeaders(*downstream_headers_, end_stream, std::move(generic_conn_pool));
     // continueDecodeHeaders can itself send a local reply, in which case should_continue_decoding
     // should be false. If this is not the case, we can continue the filter chain due to successful
     // asynchronous host selection.
@@ -719,21 +724,19 @@ void Filter::onAsyncHostSelection(Upstream::HostConstSharedPtr&& host, std::stri
   ENVOY_STREAM_LOG(debug, "Completing asynchronous host selection [{}]\n", *callbacks_, details);
   std::unique_ptr<Upstream::AsyncHostSelectionHandle> local_scope =
       std::move(host_selection_cancelable_);
-  on_host_selected_(std::move(host), details);
+
+  // The cluster argument should always be nullptr here to force refetching the cluster because
+  // the cluster may have been updated during the asynchronous host selection.
+  GenericConnPoolPtr generic_conn_pool =
+      createConnPoolOrHandleFailure(std::move(host), nullptr, details);
+  if (generic_conn_pool != nullptr) {
+    on_host_selected_(std::move(generic_conn_pool));
+  }
 }
 
-bool Filter::continueDecodeHeaders(Upstream::ThreadLocalCluster* cluster,
-                                   Http::RequestHeaderMap& headers, bool end_stream,
-                                   Upstream::HostConstSharedPtr&& selected_host,
-                                   absl::optional<std::string> host_selection_details) {
-  callbacks_->streamInfo().downstreamTiming().setValue(
-      "envoy.router.host_selection_end_ms", callbacks_->dispatcher().timeSource().monotonicTime());
-
-  std::unique_ptr<GenericConnPool> generic_conn_pool = createConnPool(*cluster, selected_host);
-  if (!generic_conn_pool) {
-    sendNoHealthyUpstreamResponse(host_selection_details);
-    return false;
-  }
+bool Filter::continueDecodeHeaders(Http::RequestHeaderMap& headers, bool end_stream,
+                                   GenericConnPoolPtr generic_conn_pool) {
+  ASSERT(generic_conn_pool != nullptr);
   Upstream::HostDescriptionConstSharedPtr host = generic_conn_pool->host();
 
   // If we've been instructed not to forward the request upstream, send an empty local response.
@@ -892,11 +895,8 @@ bool Filter::continueDecodeHeaders(Upstream::ThreadLocalCluster* cluster,
   return true;
 }
 
-std::unique_ptr<GenericConnPool> Filter::createConnPool(Upstream::ThreadLocalCluster& cluster,
-                                                        Upstream::HostConstSharedPtr host) {
-  if (host == nullptr) {
-    return nullptr;
-  }
+GenericConnPoolPtr Filter::createConnPool(Upstream::ThreadLocalCluster& cluster,
+                                          const Upstream::HostConstSharedPtr& host) {
   GenericConnPoolFactory* factory = nullptr;
   ProtobufTypes::MessagePtr message;
   if (cluster_->upstreamConfig().has_value()) {
@@ -935,6 +935,33 @@ std::unique_ptr<GenericConnPool> Filter::createConnPool(Upstream::ThreadLocalClu
 
   return factory->createGenericConnPool(host, cluster, upstream_protocol, route_entry_->priority(),
                                         callbacks_->streamInfo().protocol(), this, *message);
+}
+
+GenericConnPoolPtr Filter::createConnPoolOrHandleFailure(Upstream::HostConstSharedPtr host,
+                                                         Upstream::ThreadLocalCluster* cluster,
+                                                         absl::string_view selection_details) {
+  callbacks_->streamInfo().downstreamTiming().setValue(
+      "envoy.router.host_selection_end_ms", callbacks_->dispatcher().timeSource().monotonicTime());
+
+  GenericConnPoolPtr generic_conn_pool;
+  if (host != nullptr) {
+    if (cluster == nullptr) {
+      // Refetch the cluster because the cluster may be deleted/updated during the asynchronous host
+      // selection.
+      cluster = config_->cm_.getThreadLocalCluster(host->cluster().name());
+    }
+    if (cluster != nullptr) {
+      generic_conn_pool = createConnPool(*cluster, host);
+    }
+  }
+
+  if (generic_conn_pool == nullptr) {
+    sendNoHealthyUpstreamResponse(std::string(selection_details));
+    cleanup();
+    return nullptr;
+  }
+
+  return generic_conn_pool;
 }
 
 void Filter::sendNoHealthyUpstreamResponse(absl::optional<std::string> optional_details) {
@@ -986,46 +1013,41 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool end_strea
   // a backoff timer..
   ASSERT(upstream_requests_.size() <= 1);
 
-  bool retry_enabled = retry_state_ && retry_state_->enabled();
-  bool redirect_enabled = route_entry_ && route_entry_->internalRedirectPolicy().enabled();
+  const bool retry_enabled = retry_state_ && retry_state_->enabled();
+  const bool redirect_enabled = route_entry_ && route_entry_->internalRedirectPolicy().enabled();
+  const uint64_t effective_buffer_limit = calculateEffectiveBufferLimit();
+
 #if defined(HIGRESS)
-  bool buffering = retry_enabled || redirect_enabled || callbacks_->needBuffering();
+  bool buffering = (retry_enabled || redirect_enabled || callbacks_->needBuffering()) &&
+                   (!request_buffer_overflowed_);
 #else
-  bool buffering = retry_enabled || redirect_enabled;
+  bool buffering = (retry_enabled || redirect_enabled) && (!request_buffer_overflowed_);
 #endif
-  uint64_t effective_buffer_limit = calculateEffectiveBufferLimit();
 
   // Check if we would exceed buffer limits, regardless of current buffering state
   // This ensures error details are set even if retry state was cleared due to upstream reset.
   bool would_exceed_buffer =
       (getLength(callbacks_->decodingBuffer()) + data.length() > effective_buffer_limit);
 
-  // Handle retry/shadow buffer overflow, excluding redirect-only scenarios.
-  // For redirect scenarios, buffer overflow should only affect redirect processing, not initial
-  // request.
-  bool had_retry_or_shadow = retry_enabled;
-  bool is_redirect_only = redirect_enabled && !retry_enabled;
-
-  if (would_exceed_buffer && had_retry_or_shadow && !is_redirect_only &&
-      !request_buffer_overflowed_) {
+  // Handle buffer overflow.
+  if (buffering && would_exceed_buffer) {
     ENVOY_LOG(debug,
               "The request payload has at least {} bytes data which exceeds buffer limit {}. "
               "Giving up on buffering.",
               getLength(callbacks_->decodingBuffer()) + data.length(), effective_buffer_limit);
-
     cluster_->trafficStats()->retry_or_shadow_abandoned_.inc();
     retry_state_.reset();
-    ENVOY_LOG(debug, "retry or shadow overflow: retry_state_ reset, buffering set to false");
+    ENVOY_LOG(debug, "retry or redirect buffer overflow: skipping buffering");
     buffering = false;
     active_shadow_policies_.clear();
+    request_buffer_overflowed_ = true;
 
     // Only send local reply and cleanup if we're in a retry waiting state (no active upstream
     // requests). If there are active upstream requests, let the normal upstream failure handling
     // take precedence.
     if (upstream_requests_.empty()) {
-      request_buffer_overflowed_ = true;
-      ENVOY_LOG(debug,
-                "retry or shadow overflow: No upstream requests, resetting and calling cleanup()");
+      ENVOY_LOG(debug, "retry or redirect buffer overflow: No upstream requests, resetting and "
+                       "calling cleanup()");
       resetAll();
       cleanup();
       callbacks_->streamInfo().setResponseCodeDetails(
@@ -1036,23 +1058,10 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool end_strea
           StreamInfo::ResponseCodeDetails::get().RequestPayloadExceededRetryBufferLimit);
       return Http::FilterDataStatus::StopIterationNoBuffer;
     } else {
-      ENVOY_LOG(debug, "retry or shadow overflow: Upstream requests exist, deferring to normal "
-                       "upstream failure handling");
+      ENVOY_LOG(debug,
+                "retry or redirect buffer overflow: Upstream requests exist, deferring to normal "
+                "upstream failure handling");
     }
-  }
-
-  // Handle redirect-only buffer overflow when retry/shadow is not active.
-  // For redirect scenarios, buffer overflow should only affect redirect processing, not initial
-  // request.
-  if (would_exceed_buffer && is_redirect_only && !request_buffer_overflowed_) {
-    ENVOY_LOG(debug,
-              "The request payload has at least {} bytes data which exceeds buffer limit {}. "
-              "Marking request as buffer overflowed to cancel internal redirects.",
-              getLength(callbacks_->decodingBuffer()) + data.length(), effective_buffer_limit);
-
-    // Set the flag to cancel internal redirect processing, but allow the request to proceed
-    // normally.
-    request_buffer_overflowed_ = true;
   }
 
   for (auto* shadow_stream : shadow_streams_) {
@@ -1452,13 +1461,6 @@ void Filter::onUpstreamAbort(Http::Code code, StreamInfo::CoreResponseFlag respo
   // If we have not yet sent anything downstream, send a response with an appropriate status code.
   // Otherwise just reset the ongoing response.
   callbacks_->streamInfo().setResponseFlag(response_flags);
-
-  // Check if buffer overflow occurred and override error details accordingly
-  if (request_buffer_overflowed_) {
-    code = Http::Code::InsufficientStorage;
-    body = "exceeded request buffer limit while retrying upstream";
-    details = StreamInfo::ResponseCodeDetails::get().RequestPayloadExceededRetryBufferLimit;
-  }
 
   // This will destroy any created retry timers.
   cleanup();
@@ -2043,8 +2045,7 @@ bool Filter::setupRedirect(const Http::ResponseHeaderMap& headers) {
   const uint64_t status_code = Http::Utility::getResponseStatus(headers);
 
   // Redirects are not supported for streaming requests yet.
-  if (downstream_end_stream_ && (!request_buffer_overflowed_ || !callbacks_->decodingBuffer()) &&
-      location != nullptr &&
+  if (downstream_end_stream_ && (!request_buffer_overflowed_) && location != nullptr &&
       convertRequestHeadersForInternalRedirect(*downstream_headers_, headers, *location,
                                                status_code) &&
       callbacks_->recreateStream(&headers)) {
@@ -2205,7 +2206,11 @@ bool Filter::convertRequestHeadersForInternalRedirect(
       downstream_headers.getMethodValue() != Http::Headers::get().MethodValues.Head) {
     downstream_headers.setMethod(Http::Headers::get().MethodValues.Get);
     downstream_headers.remove(Http::Headers::get().ContentLength);
-    callbacks_->modifyDecodingBuffer([](Buffer::Instance& data) { data.drain(data.length()); });
+    // Requests without any body never allocate a decoding buffer, so we only drain when one exists.
+    // For example, a POST request with end_stream on headers will not allocate a decoding buffer.
+    if (callbacks_->decodingBuffer()) {
+      callbacks_->modifyDecodingBuffer([](Buffer::Instance& data) { data.drain(data.length()); });
+    }
   }
 
   num_internal_redirect->increment();
@@ -2405,38 +2410,33 @@ void Filter::doRetry(bool can_send_early_data, bool can_use_http3, TimeoutRetry 
     if (host_selection_response.cancelable) {
       host_selection_response.cancelable->cancel();
     }
-    // This branch handles the common case of synchronous host selection, as
-    // well as handling unsupported asynchronous host selection (by treating it
-    // as host selection failure).
-    continueDoRetry(can_send_early_data, can_use_http3, is_timeout_retry,
-                    std::move(host_selection_response.host), *cluster,
-                    std::string(host_selection_response.details));
+
+    GenericConnPoolPtr generic_conn_pool = createConnPoolOrHandleFailure(
+        std::move(host_selection_response.host), cluster, host_selection_response.details);
+    if (generic_conn_pool != nullptr) {
+      // This branch handles the common case of synchronous host selection, as
+      // well as handling unsupported asynchronous host selection (by treating it
+      // as host selection failure).
+      continueDoRetry(can_send_early_data, can_use_http3, is_timeout_retry,
+                      std::move(generic_conn_pool));
+    }
+    return;
   }
 
   ENVOY_STREAM_LOG(debug, "Handling asynchronous host selection for retry\n", *callbacks_);
   // Again latch the cancel handle, and set up the callback to be called when host
   // selection is complete.
   host_selection_cancelable_ = std::move(host_selection_response.cancelable);
-  on_host_selected_ =
-      ([this, can_send_early_data, can_use_http3, is_timeout_retry,
-        cluster](Upstream::HostConstSharedPtr&& host, std::string host_selection_details) -> void {
-        continueDoRetry(can_send_early_data, can_use_http3, is_timeout_retry, std::move(host),
-                        *cluster, host_selection_details);
-      });
+  on_host_selected_ = ([this, can_send_early_data, can_use_http3,
+                        is_timeout_retry](GenericConnPoolPtr generic_conn_pool) -> void {
+    continueDoRetry(can_send_early_data, can_use_http3, is_timeout_retry,
+                    std::move(generic_conn_pool));
+  });
 }
 
 void Filter::continueDoRetry(bool can_send_early_data, bool can_use_http3,
-                             TimeoutRetry is_timeout_retry, Upstream::HostConstSharedPtr&& host,
-                             Upstream::ThreadLocalCluster& cluster,
-                             absl::optional<std::string> host_selection_details) {
-  callbacks_->streamInfo().downstreamTiming().setValue(
-      "envoy.router.host_selection_end_ms", callbacks_->dispatcher().timeSource().monotonicTime());
-  std::unique_ptr<GenericConnPool> generic_conn_pool = createConnPool(cluster, host);
-  if (!generic_conn_pool) {
-    sendNoHealthyUpstreamResponse(host_selection_details);
-    cleanup();
-    return;
-  }
+                             TimeoutRetry is_timeout_retry, GenericConnPoolPtr generic_conn_pool) {
+  ASSERT(generic_conn_pool != nullptr);
   UpstreamRequestPtr upstream_request = std::make_unique<UpstreamRequest>(
       *this, std::move(generic_conn_pool), can_send_early_data, can_use_http3,
       allow_multiplexed_upstream_half_close_ /*enable_half_close*/);

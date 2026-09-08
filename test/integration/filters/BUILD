@@ -30,6 +30,11 @@ envoy_proto_library(
     srcs = ["test_listener_filter.proto"],
 )
 
+envoy_proto_library(
+    name = "test_filters_proto",
+    srcs = ["test_filters.proto"],
+)
+
 envoy_cc_test_library(
     name = "test_listener_filter_lib",
     srcs = [
@@ -418,6 +423,21 @@ envoy_cc_test_library(
         "modify_buffer_filter.cc",
     ],
     deps = [
+        "//envoy/http:filter_interface",
+        "//envoy/registry",
+        "//envoy/server:filter_config_interface",
+        "//source/extensions/filters/http/common:pass_through_filter_lib",
+        "//test/extensions/filters/http/common:empty_http_filter_config_lib",
+    ],
+)
+
+envoy_cc_test_library(
+    name = "add_data_and_continue_filter_lib",
+    srcs = [
+        "add_data_and_continue_filter.cc",
+    ],
+    deps = [
+        ":test_filters_proto_cc_proto",
         "//envoy/http:filter_interface",
         "//envoy/registry",
         "//envoy/server:filter_config_interface",
