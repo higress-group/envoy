@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sstream>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -244,6 +245,7 @@ private:
   std::unique_ptr<Buffer::OwnedImpl> request_body_buffer_{};
 
   bool error_{false};
+  std::string original_method_;
 };
 
 } // namespace HttpDubboTranscoder

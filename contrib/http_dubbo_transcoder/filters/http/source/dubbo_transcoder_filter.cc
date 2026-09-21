@@ -476,7 +476,9 @@ Http::FilterHeadersStatus TranscodeFilter::decodeHeaders(Http::RequestHeaderMap&
     ENVOY_STREAM_LOG(debug, "sent dubbo frame", *decoder_callbacks_);
   }
 
-  // Modify the request method to use http.tcp connection pools.
+  // CONNECT is only needed on the upstream request path; restore the original
+  // downstream method before Envoy evaluates CONNECT response tunneling.
+  original_method_ = std::string(header.getMethodValue());
   header.setMethod(Http::Headers::get().MethodValues.Connect);
   request_header_ = &header;
   return Http::FilterHeadersStatus::Continue;
@@ -528,6 +530,11 @@ Http::FilterTrailersStatus TranscodeFilter::decodeTrailers(Http::RequestTrailerM
 Http::FilterHeadersStatus TranscodeFilter::encodeHeaders(Http::ResponseHeaderMap& headers, bool) {
   if (transcoder_) {
     headers.setReferenceContentType(ContentTypeHeaderValue);
+    // Prevent the downstream HTTP/1.1 keep-alive connection from being treated
+    // as a CONNECT tunnel after the upstream Dubbo response is encoded.
+    if (request_header_ != nullptr && !original_method_.empty()) {
+      request_header_->setMethod(original_method_);
+    }
   }
   return Http::FilterHeadersStatus::Continue;
 }

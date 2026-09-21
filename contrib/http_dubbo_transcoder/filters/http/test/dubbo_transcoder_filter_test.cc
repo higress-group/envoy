@@ -104,6 +104,22 @@ TEST_F(TranscodeFilterTest, NormalHttpGetMethod) {
   EXPECT_EQ(Http::Headers::get().MethodValues.Connect, request_headers.getMethodValue());
 }
 
+TEST_F(TranscodeFilterTest, RestoreOriginalMethodOnEncodeHeaders) {
+  setConfiguration();
+  setFilter();
+
+  EXPECT_CALL(decoder_callbacks_, addDecodedData(_, true)).Times(1);
+
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"}, {":path", "/mytest.service/sayHello?my_param=test"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
+  EXPECT_EQ(Http::Headers::get().MethodValues.Connect, request_headers.getMethodValue());
+
+  Http::TestResponseHeaderMapImpl response_headers{{":status", "200"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(response_headers, false));
+  EXPECT_EQ(Http::Headers::get().MethodValues.Get, request_headers.getMethodValue());
+}
+
 TEST_F(TranscodeFilterTest, AllowUnknownMethodAndParameter) {
   setConfiguration();
   setFilter();
