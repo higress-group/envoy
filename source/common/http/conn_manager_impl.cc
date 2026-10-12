@@ -2458,7 +2458,6 @@ void ConnectionManagerImpl::ActiveStream::recreateStream(
   ENVOY_EXECUTION_SCOPE(trackedStream(), active_span_.get());
 #endif
   ResponseEncoder* response_encoder = response_encoder_;
-  response_encoder_ = nullptr;
 
   Buffer::InstancePtr request_data = std::make_unique<Buffer::OwnedImpl>();
 #if defined(HIGRESS)
@@ -2484,6 +2483,10 @@ void ConnectionManagerImpl::ActiveStream::recreateStream(
     request_data->move(*buffered_request_data);
   }
 #endif
+
+  // Null after move(): draining the WatermarkBuffer may synchronously fire
+  // onDecoderFilterBelowWriteBufferLowWatermark which needs a valid encoder.
+  response_encoder_ = nullptr;
 
   response_encoder->getStream().removeCallbacks(*this);
 
